@@ -37,3 +37,13 @@ def register_model():
         "Qwen3_5ForConditionalGeneration",
         "vllm_kunlun.models.qwen3_5:Qwen3_5ForConditionalGeneration",
     )
+
+    ModelRegistry.register_model(
+        "Qwen3_5MTP",
+        "vllm_kunlun.models.qwen3_5_mtp:Qwen3_5MTP",
+    )
+
+    ModelRegistry.register_model(
+        "Qwen3_5MoeMTP",
+        "vllm_kunlun.models.qwen3_5_mtp:Qwen3_5MoeMTP",
+    )
