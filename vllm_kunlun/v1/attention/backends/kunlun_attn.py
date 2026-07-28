@@ -982,6 +982,7 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     block_tables=tmp_block_tables,
                     sink=self._get_sinks_fp32(),
                 )
+
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)
 
