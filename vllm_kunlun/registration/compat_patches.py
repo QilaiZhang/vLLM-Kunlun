@@ -75,6 +75,24 @@ def _apply_block_table_patch(module: ModuleType) -> None:
         import vllm_kunlun.v1.worker.block_table  # noqa: F401
 
 
+# --- vllm.v1.spec_decode.eagle: patch padded-batch helpers ----------------
+
+
+def _eagle_applied(module: ModuleType) -> bool:
+    """Return whether EagleProposer uses the Kunlun padded-batch helpers."""
+    cls = getattr(module, "EagleProposer", None)
+    if cls is None:
+        return True
+    fn = getattr(cls, "prepare_next_token_ids_padded", None)
+    return fn is not None and getattr(fn, "__module__", "").startswith("vllm_kunlun")
+
+
+def _apply_eagle_patch(module: ModuleType) -> None:
+    """Import the Kunlun Eagle helpers, which patch vLLM in place."""
+    if hasattr(module, "EagleProposer"):
+        import vllm_kunlun.v1.sample.spec_decode.eagle  # noqa: F401
+
+
 # --- vllm.v1.structured_output.utils: replace apply_grammar_bitmask -------
 
 
@@ -205,6 +223,7 @@ DEFAULT_HOOKS = (
         _apply_qwen3_vl_patch,
     ),
     ("vllm.v1.worker.block_table", _block_table_applied, _apply_block_table_patch),
+    ("vllm.v1.spec_decode.eagle", _eagle_applied, _apply_eagle_patch),
     (
         "vllm.v1.structured_output.utils",
         _grammar_bitmask_applied,

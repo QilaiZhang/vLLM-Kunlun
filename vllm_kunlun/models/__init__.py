@@ -62,3 +62,12 @@ def register_model():
         "Gemma4ForConditionalGeneration",
         "vllm_kunlun.models.gemma4_mm:Gemma4ForConditionalGeneration",
     )
+    ModelRegistry.register_model(
+        "Qwen3_5MTP",
+        "vllm_kunlun.models.qwen3_5_mtp:Qwen3_5MTP",
+    )
+
+    ModelRegistry.register_model(
+        "Qwen3_5MoeMTP",
+        "vllm_kunlun.models.qwen3_5_mtp:Qwen3_5MoeMTP",
+    )
