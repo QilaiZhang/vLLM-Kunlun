@@ -482,6 +482,47 @@ class KunlunAttentionMetadataBuilder:
         self.device = device
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
 
+        # [Kunlun] Persistent per-step metadata buffers.
+        #
+        # ``build()`` used to allocate every tensor it hands to the kernel on
+        # each call. At batch 1 those allocations + H2D copies are the whole
+        # cost: profiling one MTP step showed this builder issuing 135 eager op
+        # dispatches (~1.6ms) while doing no GPU compute at all, and it runs
+        # once per attention group per forward (target *and* each draft step).
+        # Reusing buffers also makes the metadata addresses stable, which is a
+        # prerequisite for ever capturing the drafter in a cudagraph.
+        self._max_reqs = vllm_config.scheduler_config.max_num_seqs
+        self._buf_cache: dict[tuple[str, torch.dtype, str], torch.Tensor] = {}
+
+    def _staged(
+        self,
+        key: str,
+        src: torch.Tensor,
+        num: int,
+        device: torch.device | str,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        """Copy ``src[:num]`` into a persistent buffer and return the view.
+
+        Grows on demand; keyed by (name, dtype, device) so a dtype change cannot
+        silently truncate values. Pass ``dtype`` when the *source* dtype is not
+        stable across callers, otherwise one field gets two buffers and two
+        addresses: the drafter's ``query_start_loc_cpu`` is int32 on the first
+        pass (the runner's CpuGpuBuffer) but int64 inside the draft loop, where
+        upstream rebuilds it from an unannotated ``np.arange``
+        (llm_base_proposer.py). ``copy_`` casts, so fixing the dtype here also
+        normalizes what the kernels receive -- they document these lods as int32.
+        """
+        dtype = dtype or src.dtype
+        ck = (key, dtype, str(device))
+        buf = self._buf_cache.get(ck)
+        if buf is None or buf.numel() < num:
+            buf = torch.empty(max(num, self._max_reqs + 1), dtype=dtype, device=device)
+            self._buf_cache[ck] = buf
+        out = buf[:num]
+        out.copy_(src[:num], non_blocking=True)
+        return out
+
     def _init_reorder_batch_threshold(
         self,
         reorder_batch_threshold: int | None = 1,
@@ -586,6 +627,20 @@ class KunlunAttentionMetadataBuilder:
             common_attn_metadata=common_attn_metadata,
         )
 
+    def _staged_kv_lod(self, seq_lens_cpu: torch.Tensor, num_reqs: int) -> torch.Tensor:
+        """``[0, cumsum(seq_lens)]`` on the host, in a persistent int32 buffer."""
+        ck = ("kv_lod_cpu", torch.int32, "cpu")
+        buf = self._buf_cache.get(ck)
+        if buf is None or buf.numel() < num_reqs + 1:
+            buf = torch.zeros(
+                max(num_reqs + 1, self._max_reqs + 1), dtype=torch.int32, device="cpu"
+            )
+            self._buf_cache[ck] = buf
+        out = buf[: num_reqs + 1]
+        out[0] = 0
+        torch.cumsum(seq_lens_cpu[:num_reqs].to(torch.int32), dim=0, out=out[1:])
+        return out
+
     def build(
         self, common_prefix_len: int, common_attn_metadata: CommonAttentionMetadata
     ):
@@ -597,13 +652,37 @@ class KunlunAttentionMetadataBuilder:
         block_table_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
 
-        query_start_loc_host = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
-        query_start_loc = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1].to(
-            self.device, non_blocking=True
+        # The host mirrors go through persistent buffers as well, not just the
+        # device copies: upstream hands the drafter a freshly ``clone()``d
+        # ``query_start_loc_cpu`` on every step (llm_base_proposer.py) and
+        # ``seq_lens_cpu`` is a lazy property that redoes the D2H allocation
+        # whenever ``_seq_lens_cpu`` is None, so both moved every step. The
+        # kernels read these host mirrors directly (``context_qlen_lod_cpu`` /
+        # ``context_lens_cpu``), and stable addresses are a prerequisite for
+        # capturing the drafter in a cudagraph.
+        query_start_loc_host = self._staged(
+            "query_start_loc_host",
+            common_attn_metadata.query_start_loc_cpu,
+            num_reqs + 1,
+            "cpu",
+            torch.int32,
+        )
+        query_start_loc = self._staged(
+            "query_start_loc",
+            query_start_loc_host,
+            num_reqs + 1,
+            self.device,
+            torch.int32,
         )
 
         seq_lens = common_attn_metadata.seq_lens
-        seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+        seq_lens_cpu = self._staged(
+            "seq_lens_cpu",
+            common_attn_metadata.seq_lens_cpu,
+            num_reqs,
+            "cpu",
+            torch.int32,
+        )
 
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
@@ -614,16 +693,15 @@ class KunlunAttentionMetadataBuilder:
         )
 
         if num_prefill_tokens > 0:
-            kv_lod_cpu = torch.zeros(num_reqs + 1, dtype=torch.int32, device="cpu")
-            kv_lod_cpu[1:] = seq_lens_cpu.to(torch.int32).cumsum(dim=0)
-            kv_lod_xpu = kv_lod_cpu.to(self.device, non_blocking=True)
+            kv_lod_cpu = self._staged_kv_lod(seq_lens_cpu, num_reqs)
+            kv_lod_xpu = self._staged(
+                "kv_lod_xpu", kv_lod_cpu, num_reqs + 1, self.device
+            )
         else:
             kv_lod_cpu = None
             kv_lod_xpu = None
 
-        num_scheduled_tokens = np.diff(
-            common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
-        )
+        num_scheduled_tokens = np.diff(query_start_loc_host)
         tmp_decode_scheduled_tokens = num_scheduled_tokens[:num_decodes]
 
         if num_decode_tokens == 0:
