@@ -20,6 +20,7 @@ from typing import Callable, Optional, Union
 
 import torch
 from compressed_tensors import CompressionFormat
+from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
@@ -120,19 +121,36 @@ class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
 class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
     def __init__(
         self,
-        weight_quant,
-        input_quant,
+        weight_quant: QuantizationArgs,
+        input_quant: QuantizationArgs,
         moe: "FusedMoEConfig",
         layer_name: str | None = None,
     ):
-        # Skip the parent __init__ which calls select_int8_moe_backend
-        # (not applicable on Kunlun XPU). Instead, directly init FusedMoEMethodBase.
-        from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase
-
+        # Deliberately skip the parent initializer: its CUDA/TRITON backend
+        # selection is not applicable on Kunlun XPU.
         FusedMoEMethodBase.__init__(self, moe)
         self.weight_quant = weight_quant
         self.input_quant = input_quant
+
+        per_channel = (
+            self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and self.input_quant.strategy == QuantizationStrategy.TOKEN
+        )
+        if not per_channel:
+            raise ValueError(
+                "For INT8 Fused MoE layers, we require channelwise, "
+                "dynamic per token quantization. Found "
+                f"{self.weight_quant}, {self.input_quant}"
+            )
+
         self.static_input_scales = not self.input_quant.dynamic
+        if self.static_input_scales:
+            raise ValueError(
+                "For INT8 Fused MoE layers, we require channelwise, "
+                "dynamic per token quantization. Found static input scales."
+            )
+
+        # Consumed only by the upstream (unused here) modular-kernel path.
         self.int8_backend = None
         self.experts_cls = None
 
