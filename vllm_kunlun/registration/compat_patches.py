@@ -93,6 +93,47 @@ def _apply_eagle_patch(module: ModuleType) -> None:
         import vllm_kunlun.v1.sample.spec_decode.eagle  # noqa: F401
 
 
+# --- vllm.v1.spec_decode.suffix_decoding: pad dynamic drafts --------------
+
+
+def _suffix_decoding_applied(module: ModuleType) -> bool:
+    """Return whether suffix drafts are padded for FULL cudagraph execution."""
+    cls = getattr(module, "SuffixDecodingProposer", None)
+    if cls is None:
+        return True
+    fn = getattr(cls, "propose", None)
+    return fn is not None and getattr(fn, "__module__", "").startswith("vllm_kunlun")
+
+
+def _apply_suffix_decoding_patch(module: ModuleType) -> None:
+    """Import the Kunlun suffix-decoding proposer patch."""
+    if hasattr(module, "SuffixDecodingProposer"):
+        import vllm_kunlun.v1.sample.spec_decode.suffix_decoding  # noqa: F401
+
+
+# --- worker consumers: re-anchor speculative Mamba state -----------------
+
+
+def _gpu_model_runner_applied(_consumer_module: ModuleType) -> bool:
+    """Return whether GPUModelRunner._prepare_inputs is re-anchor aware."""
+    runner_module = sys.modules.get("vllm.v1.worker.gpu_model_runner")
+    cls = getattr(runner_module, "GPUModelRunner", None)
+    if cls is None:
+        return False
+    fn = getattr(cls, "_prepare_inputs", None)
+    return fn is not None and getattr(fn, "_kunlun_spec_reanchor_patched", False)
+
+
+def _apply_gpu_model_runner_patch(_consumer_module: ModuleType) -> None:
+    """Patch the fully initialized GPUModelRunner from a worker consumer."""
+    runner_module = sys.modules.get("vllm.v1.worker.gpu_model_runner")
+    if runner_module is None or not hasattr(runner_module, "GPUModelRunner"):
+        return
+    from vllm_kunlun.v1.worker.mamba_utils import patch_gpu_model_runner
+
+    patch_gpu_model_runner(runner_module)
+
+
 # --- vllm.v1.structured_output.utils: replace apply_grammar_bitmask -------
 
 
@@ -224,6 +265,21 @@ DEFAULT_HOOKS = (
     ),
     ("vllm.v1.worker.block_table", _block_table_applied, _apply_block_table_patch),
     ("vllm.v1.spec_decode.eagle", _eagle_applied, _apply_eagle_patch),
+    (
+        "vllm.v1.spec_decode.suffix_decoding",
+        _suffix_decoding_applied,
+        _apply_suffix_decoding_patch,
+    ),
+    (
+        "vllm.v1.worker.gpu_worker",
+        _gpu_model_runner_applied,
+        _apply_gpu_model_runner_patch,
+    ),
+    (
+        "vllm.v1.worker.xpu_model_runner",
+        _gpu_model_runner_applied,
+        _apply_gpu_model_runner_patch,
+    ),
     (
         "vllm.v1.structured_output.utils",
         _grammar_bitmask_applied,
