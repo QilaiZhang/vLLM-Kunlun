@@ -134,6 +134,24 @@ def _apply_gpu_model_runner_patch(_consumer_module: ModuleType) -> None:
     patch_gpu_model_runner(runner_module)
 
 
+# --- vllm.v1.core.kv_cache_coordinator: Mamba prefix-hit accounting -------
+
+
+def _mamba_prefix_hit_applied(module: ModuleType) -> bool:
+    """Return whether Mamba groups avoid EAGLE's extend-and-pop accounting."""
+    cls = getattr(module, "KVCacheCoordinator", None)
+    if cls is None:
+        return True
+    fn = getattr(cls, "__init__", None)
+    return fn is not None and getattr(fn, "__module__", "").startswith("vllm_kunlun")
+
+
+def _apply_mamba_prefix_hit_patch(module: ModuleType) -> None:
+    """Import the Kunlun KV-cache coordinator patch."""
+    if hasattr(module, "KVCacheCoordinator"):
+        import vllm_kunlun.v1.core.mamba_prefix_hit  # noqa: F401
+
+
 # --- vllm.v1.structured_output.utils: replace apply_grammar_bitmask -------
 
 
@@ -279,6 +297,11 @@ DEFAULT_HOOKS = (
         "vllm.v1.worker.xpu_model_runner",
         _gpu_model_runner_applied,
         _apply_gpu_model_runner_patch,
+    ),
+    (
+        "vllm.v1.core.kv_cache_coordinator",
+        _mamba_prefix_hit_applied,
+        _apply_mamba_prefix_hit_patch,
     ),
     (
         "vllm.v1.structured_output.utils",
