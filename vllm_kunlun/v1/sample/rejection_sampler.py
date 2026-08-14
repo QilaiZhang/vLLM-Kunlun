@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import replace
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import kunlun_ops
 import torch
-import torch.nn as nn
 import xspeedgate_ops  # noqa: F401  (registers torch.ops.xspeedgate_ops)
+from torch import nn
 from vllm.logger import init_logger
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
 from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
@@ -91,7 +91,7 @@ class RejectionSampler(nn.Module):
         self,
         metadata: SpecDecodeMetadata,
         # [num_tokens, vocab_size]
-        draft_probs: Optional[torch.Tensor],
+        draft_probs: torch.Tensor | None,
         # [num_tokens + batch_size, vocab_size]
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
@@ -282,6 +282,7 @@ class RejectionSampler(nn.Module):
                 sampling_metadata.spec_token_ids,
             )
 
+        # Calculate indices of target logits.
         repeat_indices: torch.Tensor | None = None
         need_repeat_indices = (
             sampling_metadata.allowed_token_ids_mask is not None
@@ -376,7 +377,7 @@ def rejection_sample(
     # [batch_size]
     cu_num_draft_tokens: torch.Tensor,
     # [num_tokens, vocab_size]
-    draft_probs: Optional[torch.Tensor],
+    draft_probs: torch.Tensor | None,
     # [num_tokens, vocab_size]
     target_probs: torch.Tensor,
     # [batch_size, 1]
@@ -672,7 +673,7 @@ def sample_recovered_tokens(
     # [num_tokens]
     draft_token_ids: torch.Tensor,
     # [num_tokens, vocab_size]
-    draft_probs: Optional[torch.Tensor],
+    draft_probs: torch.Tensor | None,
     # [num_tokens, vocab_size]
     target_probs: torch.Tensor,
     sampling_metadata: SamplingMetadata,
