@@ -9,7 +9,12 @@ from typing import Any
 
 import torch
 from vllm.config import CacheConfig
-from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFunc
+from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateCopyFunc,
+    get_conv_copy_spec,
+    get_temporal_copy_spec,
+    is_conv_state_dim_first,
+)
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
@@ -354,20 +359,284 @@ def preprocess_mamba(
 
 
 @dataclasses.dataclass
-class MambaBuffers:
-    """Single owner for all mamba-specific runner buffers.
+class MambaSpecDecodeGPUContext:
+    """Kunlun device-side state-copy context for hybrid spec decoding.
 
-    On Kunlun XPU, speculative decoding with hybrid models is not supported,
-    so postprocess_align is always None.
+    vLLM's CUDA implementation uses a Triton kernel to compute copy decisions
+    and move Mamba states. Kunlun already provides ``batch_memcpy`` in
+    xspeedgate, so this context computes the same addresses with device tensor
+    operations and submits all copies through that operator. No accepted-token
+    value is synchronized back to Python on the critical path.
     """
 
+    state_base_addrs: torch.Tensor
+    state_block_strides: torch.Tensor
+    state_elem_sizes: torch.Tensor
+    state_inner_sizes: torch.Tensor
+    state_conv_widths: torch.Tensor
+    state_group_indices: torch.Tensor
+    block_size: int
+    max_num_reqs: int
+    num_layers: int
+    num_state_types: int
+    mamba_group_ids: list[int]
+    num_groups: int
+    num_accepted_tokens_out: torch.Tensor
+    block_table_ptrs: torch.Tensor
+    block_table_stride_req: int = 0
+    mamba_state_idx_buf: CpuGpuBuffer | None = None
+    num_scheduled_tokens_buf: CpuGpuBuffer | None = None
+    num_computed_tokens_buf: CpuGpuBuffer | None = None
+    num_draft_tokens_buf: CpuGpuBuffer | None = None
+    block_tables: list[torch.Tensor] = dataclasses.field(default_factory=list)
+    state_group_indices_host: list[int] = dataclasses.field(default_factory=list)
+    state_is_conv_host: list[bool] = dataclasses.field(default_factory=list)
+    is_initialized: bool = False
+
+    @classmethod
+    def create(
+        cls,
+        max_num_reqs: int,
+        kv_cache_config: KVCacheConfig,
+        num_state_types: int,
+        device: torch.device,
+        make_buffer: Callable[..., CpuGpuBuffer],
+    ) -> "MambaSpecDecodeGPUContext":
+        mamba_group_ids, mamba_spec = get_mamba_groups(kv_cache_config)
+        num_layers = sum(
+            len(kv_cache_config.kv_cache_groups[gid].layer_names)
+            for gid in mamba_group_ids
+        )
+        total_states = num_layers * num_state_types
+        return cls(
+            state_base_addrs=torch.zeros(
+                total_states, dtype=torch.int64, device=device
+            ),
+            state_block_strides=torch.zeros(
+                total_states, dtype=torch.int64, device=device
+            ),
+            state_elem_sizes=torch.zeros(
+                total_states, dtype=torch.int64, device=device
+            ),
+            state_inner_sizes=torch.zeros(
+                total_states, dtype=torch.int64, device=device
+            ),
+            state_conv_widths=torch.zeros(
+                total_states, dtype=torch.int64, device=device
+            ),
+            state_group_indices=torch.zeros(
+                total_states, dtype=torch.int64, device=device
+            ),
+            block_size=mamba_spec.block_size,
+            max_num_reqs=max_num_reqs,
+            num_layers=num_layers,
+            num_state_types=num_state_types,
+            mamba_group_ids=mamba_group_ids,
+            num_groups=len(mamba_group_ids),
+            num_accepted_tokens_out=torch.zeros(
+                max_num_reqs, dtype=torch.int32, device=device
+            ),
+            block_table_ptrs=torch.zeros(
+                len(mamba_group_ids), dtype=torch.int64, device=device
+            ),
+            mamba_state_idx_buf=make_buffer(max_num_reqs, dtype=torch.int32),
+            num_scheduled_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
+            num_computed_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
+            num_draft_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
+        )
+
+    def initialize_from_forward_context(
+        self,
+        kv_cache_config: KVCacheConfig,
+        forward_context: dict[str, Any],
+        mamba_state_copy_funcs: tuple[MambaStateCopyFunc, ...],
+        block_tables: list[torch.Tensor],
+    ) -> None:
+        """Bind persistent state tensors and block tables on first use."""
+        if self.is_initialized:
+            return
+        if is_conv_state_dim_first():
+            raise NotImplementedError(
+                "Kunlun hybrid speculative decoding currently requires the "
+                "default SD Mamba conv-state layout"
+            )
+        if len(block_tables) != self.num_groups:
+            raise ValueError(
+                f"expected {self.num_groups} Mamba block tables, "
+                f"got {len(block_tables)}"
+            )
+
+        state_group_indices_host: list[int] = []
+        state_is_conv_host: list[bool] = []
+        idx = 0
+        for group_local_idx, mamba_group_id in enumerate(self.mamba_group_ids):
+            layer_names = kv_cache_config.kv_cache_groups[
+                mamba_group_id
+            ].layer_names
+            for layer_name in layer_names:
+                kv_caches: list[torch.Tensor] = forward_context[layer_name].kv_cache
+                if len(kv_caches) != self.num_state_types:
+                    raise ValueError(
+                        f"Mamba layer {layer_name!r} exposes {len(kv_caches)} "
+                        f"states, expected {self.num_state_types}"
+                    )
+                for state_type_idx, state in enumerate(kv_caches):
+                    copy_func = mamba_state_copy_funcs[state_type_idx]
+                    if copy_func not in (get_conv_copy_spec, get_temporal_copy_spec):
+                        raise ValueError(f"unexpected Mamba copy func: {copy_func}")
+                    is_conv = copy_func is get_conv_copy_spec
+                    if is_conv and state.dim() != 3:
+                        raise ValueError(
+                            "Expected 3D conv state cache, got "
+                            f"shape {tuple(state.shape)}"
+                        )
+
+                    elem_size = state.element_size()
+                    block_stride = (
+                        state.stride(0) if state.dim() > 1 else state.numel()
+                    )
+                    self.state_base_addrs[idx] = state.data_ptr()
+                    self.state_block_strides[idx] = block_stride * elem_size
+                    self.state_elem_sizes[idx] = elem_size
+                    if is_conv:
+                        self.state_conv_widths[idx] = state.size(1)
+                        self.state_inner_sizes[idx] = state.stride(1)
+                    else:
+                        self.state_conv_widths[idx] = 0
+                        self.state_inner_sizes[idx] = (
+                            state[0].numel() if state.dim() > 1 else 1
+                        )
+                    self.state_group_indices[idx] = group_local_idx
+                    state_group_indices_host.append(group_local_idx)
+                    state_is_conv_host.append(is_conv)
+                    idx += 1
+
+        strides = {table.stride(0) for table in block_tables}
+        if len(strides) != 1:
+            raise ValueError(
+                "all Mamba block tables must share stride(0), "
+                f"got {strides}"
+            )
+        self.block_table_stride_req = int(next(iter(strides)))
+        full_block_tables: list[torch.Tensor] = []
+        for i, table in enumerate(block_tables):
+            self.block_table_ptrs[i] = table.data_ptr()
+            # get_device_tensor(num_reqs) returns a logical row slice of a
+            # persistent max_num_reqs allocation. Keep a full-row view so a
+            # later, larger batch does not retain the first batch's row bound.
+            full_block_tables.append(
+                table.as_strided(
+                    (self.max_num_reqs, table.shape[1]),
+                    table.stride(),
+                    table.storage_offset(),
+                )
+            )
+        self.block_tables = full_block_tables
+        self.state_group_indices_host = state_group_indices_host
+        self.state_is_conv_host = state_is_conv_host
+        self.is_initialized = True
+
+    def run_fused_postprocess(
+        self,
+        num_reqs: int,
+        num_accepted_tokens_gpu: torch.Tensor,
+        mamba_state_idx_gpu: torch.Tensor,
+        num_scheduled_tokens_gpu: torch.Tensor,
+        num_computed_tokens_gpu: torch.Tensor,
+        num_draft_tokens_gpu: torch.Tensor,
+    ) -> None:
+        """Compute state-copy addresses on XPU and submit one batched copy."""
+        if num_reqs == 0 or not self.is_initialized:
+            return
+        if num_reqs > self.max_num_reqs:
+            raise ValueError(
+                f"num_reqs {num_reqs} exceeds maximum {self.max_num_reqs}"
+            )
+
+        accepted = num_accepted_tokens_gpu[:num_reqs].to(torch.int64)
+        src_col = mamba_state_idx_gpu[:num_reqs].to(torch.int64)
+        running_tokens = (
+            num_computed_tokens_gpu[:num_reqs].to(torch.int64)
+            + num_scheduled_tokens_gpu[:num_reqs].to(torch.int64)
+            - num_draft_tokens_gpu[:num_reqs].to(torch.int64)
+        )
+        new_computed = running_tokens + accepted - 1
+        aligned_computed = new_computed // self.block_size * self.block_size
+        needs_copy = aligned_computed >= running_tokens
+        token_bias = aligned_computed - running_tokens
+        dest_col = aligned_computed // self.block_size - 1
+        same_col = src_col == dest_col
+
+        accepted_out = torch.where(
+            needs_copy & same_col, torch.ones_like(accepted), accepted
+        )
+        self.num_accepted_tokens_out[:num_reqs].copy_(
+            accepted_out.to(torch.int32)
+        )
+        copy_mask = needs_copy & ~(same_col & (token_bias == 0))
+
+        rows = torch.arange(
+            num_reqs, dtype=torch.long, device=num_accepted_tokens_gpu.device
+        )
+        group_block_ids: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        for table in self.block_tables:
+            last_col = table.shape[1] - 1
+            dest_ids = table[rows, dest_col.clamp(0, last_col)].to(torch.int64)
+            conv_src_ids = table[rows, src_col.clamp(0, last_col)].to(torch.int64)
+            temporal_src_ids = table[
+                rows, (src_col + token_bias).clamp(0, last_col)
+            ].to(torch.int64)
+            group_block_ids.append((dest_ids, conv_src_ids, temporal_src_ids))
+
+        src_ptrs: list[torch.Tensor] = []
+        dst_ptrs: list[torch.Tensor] = []
+        copy_sizes: list[torch.Tensor] = []
+        total_states = self.num_layers * self.num_state_types
+        for state_idx in range(total_states):
+            group_idx = self.state_group_indices_host[state_idx]
+            dest_ids, conv_src_ids, temporal_src_ids = group_block_ids[group_idx]
+            base_addr = self.state_base_addrs[state_idx]
+            block_stride = self.state_block_strides[state_idx]
+            elem_size = self.state_elem_sizes[state_idx]
+            inner_size = self.state_inner_sizes[state_idx]
+            dst_ptr = base_addr + dest_ids * block_stride
+
+            if self.state_is_conv_host[state_idx]:
+                src_ptr = (
+                    base_addr
+                    + conv_src_ids * block_stride
+                    + token_bias * inner_size * elem_size
+                )
+                size = (
+                    (self.state_conv_widths[state_idx] - token_bias)
+                    .clamp_min(0)
+                    * inner_size
+                    * elem_size
+                )
+            else:
+                src_ptr = base_addr + temporal_src_ids * block_stride
+                size = torch.ones_like(token_bias) * inner_size * elem_size
+
+            src_ptrs.append(src_ptr)
+            dst_ptrs.append(dst_ptr)
+            copy_sizes.append(torch.where(copy_mask, size, torch.zeros_like(size)))
+
+        # [request, state] order is convenient for inspecting failures, but the
+        # batch memcpy operator only requires the three flattened arrays to
+        # have matching order.
+        batch_memcpy(
+            torch.stack(src_ptrs, dim=1).reshape(-1),
+            torch.stack(dst_ptrs, dim=1).reshape(-1),
+            torch.stack(copy_sizes, dim=1).reshape(-1),
+        )
+
+
+@dataclasses.dataclass
+class MambaBuffers:
+    """Single owner for all mamba-specific runner buffers."""
+
     preprocess: MambaCopyBuffers
-    # TODO(kunlun): MambaSpecDecodeGPUContext is not implemented on Kunlun XPU.
-    # postprocess_align is required when running speculative decoding on a hybrid
-    # model (e.g. DeepSeek V4 flash). When that use case is needed, implement
-    # MambaSpecDecodeGPUContext in this file (referencing vllm 0.25.1 upstream)
-    # and replace the None stub below.
-    postprocess_align: None = None
+    postprocess_align: MambaSpecDecodeGPUContext | None
 
     @classmethod
     def create(
@@ -376,22 +645,24 @@ class MambaBuffers:
         kv_cache_config: KVCacheConfig,
         copy_funcs: tuple[MambaStateCopyFunc, ...],
         make_buffer: Callable[..., CpuGpuBuffer],
-        device=None,
+        device: torch.device,
         with_postprocess_align: bool = False,
     ) -> "MambaBuffers":
-        if with_postprocess_align:
-            # TODO(kunlun): implement MambaSpecDecodeGPUContext for spec-decode
-            # + hybrid model support (e.g. DeepSeek V4 flash).
-            raise NotImplementedError(
-                "Speculative decoding on hybrid Mamba models is not yet "
-                "supported on Kunlun XPU. Need to implement "
-                "MambaSpecDecodeGPUContext."
-            )
         return cls(
             preprocess=MambaCopyBuffers.create(
                 max_num_reqs, kv_cache_config, copy_funcs, make_buffer
             ),
-            postprocess_align=None,
+            postprocess_align=(
+                MambaSpecDecodeGPUContext.create(
+                    max_num_reqs=max_num_reqs,
+                    kv_cache_config=kv_cache_config,
+                    num_state_types=len(copy_funcs),
+                    device=device,
+                    make_buffer=make_buffer,
+                )
+                if with_postprocess_align
+                else None
+            ),
         )
 
 
@@ -501,3 +772,171 @@ def postprocess_mamba(
             if src_block_idx == dest_block_idx:
                 num_accepted_tokens_cpu[i] = 1
     do_mamba_copy_block(copy_bufs)
+
+
+def cleanup_mamba_state_idx(
+    scheduler_output: SchedulerOutput,
+    mamba_state_idx: dict[str, int],
+) -> None:
+    """Drop state-column entries invalidated by scheduler lifecycle events."""
+    resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
+    for req_id in itertools.chain(
+        scheduler_output.finished_req_ids,
+        scheduler_output.preempted_req_ids or set(),
+        resumed_req_ids,
+    ):
+        mamba_state_idx.pop(req_id, None)
+
+
+def postprocess_mamba_all(
+    scheduler_output: SchedulerOutput,
+    kv_cache_config: KVCacheConfig,
+    input_batch: GPUInputBatch,
+    requests: dict[str, CachedRequestState],
+    mamba_state_idx: dict[str, int],
+    num_spec_tokens: int,
+    num_reqs: int,
+) -> None:
+    """Track the last speculative state column for ``all`` cache mode."""
+    if num_spec_tokens <= 0:
+        return
+    _, mamba_spec = get_mamba_groups(kv_cache_config)
+    full_decode_len = 1 + num_spec_tokens
+    for req_id in input_batch.req_ids[:num_reqs]:
+        num_query = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+        if num_query == full_decode_len:
+            seq_len = requests[req_id].num_computed_tokens + num_query
+            mamba_state_idx[req_id] = max(
+                0, (seq_len - 1) // mamba_spec.block_size
+            )
+        else:
+            mamba_state_idx.pop(req_id, None)
+
+
+def preprocess_mamba_all_specdec(
+    scheduler_output: SchedulerOutput,
+    input_batch: GPUInputBatch,
+    mamba_state_idx: dict[str, int],
+    num_reqs: int,
+    prev_last_scheduled_idx_buf: CpuGpuBuffer,
+) -> None:
+    """Stage the previous speculative state columns for ``all`` mode."""
+    cleanup_mamba_state_idx(scheduler_output, mamba_state_idx)
+    np_view = prev_last_scheduled_idx_buf.np
+    for i, req_id in enumerate(input_batch.req_ids[:num_reqs]):
+        np_view[i] = mamba_state_idx.get(req_id, -1)
+    np_view[num_reqs:].fill(-1)
+    prev_last_scheduled_idx_buf.copy_to_gpu()
+
+
+def postprocess_mamba_align_gpu(
+    *,
+    bufs: MambaBuffers,
+    num_reqs: int,
+    num_accepted_tokens_gpu: torch.Tensor,
+    num_accepted_tokens_cpu_tensor: torch.Tensor,
+    input_batch: GPUInputBatch,
+    kv_cache_config: KVCacheConfig,
+    forward_context: dict[str, Any],
+    mamba_state_copy_funcs: tuple[MambaStateCopyFunc, ...],
+) -> None:
+    """Run Kunlun's device-side align-mode speculative postprocess."""
+    ctx = bufs.postprocess_align
+    assert ctx is not None
+    assert ctx.mamba_state_idx_buf is not None
+    assert ctx.num_scheduled_tokens_buf is not None
+    assert ctx.num_computed_tokens_buf is not None
+    assert ctx.num_draft_tokens_buf is not None
+
+    if not ctx.is_initialized:
+        ctx.initialize_from_forward_context(
+            kv_cache_config,
+            forward_context,
+            mamba_state_copy_funcs,
+            [
+                input_batch.block_table[gid].get_device_tensor(num_reqs)
+                for gid in ctx.mamba_group_ids
+            ],
+        )
+    ctx.run_fused_postprocess(
+        num_reqs=num_reqs,
+        num_accepted_tokens_gpu=num_accepted_tokens_gpu,
+        mamba_state_idx_gpu=ctx.mamba_state_idx_buf.gpu,
+        num_scheduled_tokens_gpu=ctx.num_scheduled_tokens_buf.gpu,
+        num_computed_tokens_gpu=ctx.num_computed_tokens_buf.gpu,
+        num_draft_tokens_gpu=ctx.num_draft_tokens_buf.gpu,
+    )
+    num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+        ctx.num_accepted_tokens_out[:num_reqs], non_blocking=True
+    )
+
+
+def stage_postprocess_metadata_to_gpu(
+    scheduler_output: SchedulerOutput,
+    req_ids: list[str],
+    num_reqs: int,
+    requests: dict[str, CachedRequestState],
+    num_scheduled_tokens_buf: CpuGpuBuffer,
+    num_computed_tokens_buf: CpuGpuBuffer,
+    num_draft_tokens_buf: CpuGpuBuffer,
+) -> None:
+    """Stage per-request align postprocess inputs without a device sync."""
+    scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+    num_scheduled = scheduler_output.num_scheduled_tokens
+    scheduled_np = num_scheduled_tokens_buf.np
+    computed_np = num_computed_tokens_buf.np
+    draft_np = num_draft_tokens_buf.np
+    for i in range(num_reqs):
+        req_id = req_ids[i]
+        scheduled_np[i] = num_scheduled[req_id]
+        computed_np[i] = requests[req_id].num_computed_tokens
+        draft_np[i] = len(scheduled_spec_tokens.get(req_id, ()))
+    num_scheduled_tokens_buf.copy_to_gpu(num_reqs)
+    num_computed_tokens_buf.copy_to_gpu(num_reqs)
+    num_draft_tokens_buf.copy_to_gpu(num_reqs)
+
+
+def stage_mamba_state_idx_to_gpu(
+    mamba_state_idx: dict[str, int],
+    req_ids: list[str],
+    num_reqs: int,
+    gpu_buf: CpuGpuBuffer,
+) -> None:
+    """Materialize the preprocess result in batch order on the device."""
+    np_view = gpu_buf.np
+    for i in range(num_reqs):
+        req_id = req_ids[i]
+        state_idx = mamba_state_idx.get(req_id)
+        assert state_idx is not None, (
+            f"mamba_state_idx missing entry for {req_id!r}; "
+            "preprocess_mamba must run before postprocess staging"
+        )
+        np_view[i] = state_idx
+    gpu_buf.copy_to_gpu(num_reqs)
+
+
+def stage_postprocess_inputs_to_gpu(
+    ctx: MambaSpecDecodeGPUContext,
+    scheduler_output: SchedulerOutput,
+    req_ids: list[str],
+    num_reqs: int,
+    requests: dict[str, CachedRequestState],
+    mamba_state_idx: dict[str, int],
+) -> None:
+    """Stage every input consumed by ``run_fused_postprocess``."""
+    assert ctx.mamba_state_idx_buf is not None
+    assert ctx.num_scheduled_tokens_buf is not None
+    assert ctx.num_computed_tokens_buf is not None
+    assert ctx.num_draft_tokens_buf is not None
+    stage_mamba_state_idx_to_gpu(
+        mamba_state_idx, req_ids, num_reqs, ctx.mamba_state_idx_buf
+    )
+    stage_postprocess_metadata_to_gpu(
+        scheduler_output,
+        req_ids,
+        num_reqs,
+        requests,
+        ctx.num_scheduled_tokens_buf,
+        ctx.num_computed_tokens_buf,
+        ctx.num_draft_tokens_buf,
+    )
