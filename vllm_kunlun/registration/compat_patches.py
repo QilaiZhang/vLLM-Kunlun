@@ -201,6 +201,19 @@ def _apply_memory_pool_patch(module: ModuleType) -> None:
     )
 
 
+def _gpu_worker_patches_applied(module: ModuleType) -> bool:
+    """Return whether both Kunlun gpu_worker compatibility patches apply."""
+    return _memory_pool_applied(module) and _gpu_model_runner_applied(module)
+
+
+def _apply_gpu_worker_patches(module: ModuleType) -> None:
+    """Apply memory-pool and speculative Mamba patches from one hook target."""
+    if not _memory_pool_applied(module):
+        _apply_memory_pool_patch(module)
+    if not _gpu_model_runner_applied(module):
+        _apply_gpu_model_runner_patch(module)
+
+
 # --- vllm.model_executor.warmup.kernel_warmup: skip Triton warmup ----------
 
 
@@ -289,11 +302,6 @@ DEFAULT_HOOKS = (
         _apply_suffix_decoding_patch,
     ),
     (
-        "vllm.v1.worker.gpu_worker",
-        _gpu_model_runner_applied,
-        _apply_gpu_model_runner_patch,
-    ),
-    (
         "vllm.v1.worker.xpu_model_runner",
         _gpu_model_runner_applied,
         _apply_gpu_model_runner_patch,
@@ -308,7 +316,11 @@ DEFAULT_HOOKS = (
         _grammar_bitmask_applied,
         _apply_grammar_bitmask_patch,
     ),
-    ("vllm.v1.worker.gpu_worker", _memory_pool_applied, _apply_memory_pool_patch),
+    (
+        "vllm.v1.worker.gpu_worker",
+        _gpu_worker_patches_applied,
+        _apply_gpu_worker_patches,
+    ),
     (
         "vllm.model_executor.warmup.kernel_warmup",
         _warmup_applied,
