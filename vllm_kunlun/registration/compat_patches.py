@@ -138,17 +138,17 @@ def _apply_gpu_model_runner_patch(_consumer_module: ModuleType) -> None:
 
 
 def _mamba_prefix_hit_applied(module: ModuleType) -> bool:
-    """Return whether Mamba groups avoid EAGLE's extend-and-pop accounting."""
-    cls = getattr(module, "KVCacheCoordinator", None)
+    """Return whether hybrid Mamba uses MTP-aware hit negotiation."""
+    cls = getattr(module, "HybridKVCacheCoordinator", None)
     if cls is None:
         return True
-    fn = getattr(cls, "__init__", None)
+    fn = getattr(cls, "find_longest_cache_hit", None)
     return fn is not None and getattr(fn, "__module__", "").startswith("vllm_kunlun")
 
 
 def _apply_mamba_prefix_hit_patch(module: ModuleType) -> None:
     """Import the Kunlun KV-cache coordinator patch."""
-    if hasattr(module, "KVCacheCoordinator"):
+    if hasattr(module, "HybridKVCacheCoordinator"):
         import vllm_kunlun.v1.core.mamba_prefix_hit  # noqa: F401
 
 
