@@ -50,11 +50,203 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 logger = init_logger(__name__)
 
 
+def _trim_prefill_block_tables(
+    block_tables: torch.Tensor,
+    kv_lod_cpu: torch.Tensor,
+    kernel_block_size: int,
+) -> torch.Tensor:
+    """Drop padded page-table columns before cache-backed prefill attention.
+
+    XFA derives ``max_context_len`` from the page-table width rather than the
+    actual KV LoD.  Hybrid models can have a table sized for the full model
+    length (for example 1024 64-token pages) while a DFlash step only uses one
+    page.  Keeping the padded columns can make the non-causal SWA kernel touch
+    invalid page IDs.
+    """
+    kv_lens = kv_lod_cpu[1:] - kv_lod_cpu[:-1]
+    max_kv_len = int(kv_lens.max().item())
+    required_blocks = max(1, cdiv(max_kv_len, kernel_block_size))
+    return block_tables[:, :required_blocks]
+
+
+def _resolve_prefill_swa(
+    sliding_window: int | None,
+    causal: bool,
+    kv_lod_cpu: torch.Tensor,
+) -> tuple[int, int]:
+    """Translate vLLM SWA metadata to the XFA prefill contract.
+
+    XFA currently faults for cache-backed, non-causal attention when a
+    positive right window is supplied.  If every KV sequence is shorter than
+    the configured window, SWA is mathematically identical to full attention,
+    so omit both window arguments.  This is the common early DFlash proposal
+    path and avoids the unsupported kernel branch without changing results.
+
+    Longer non-causal windows still need an operator-side fix (or an explicit
+    mask fallback); keep their arguments intact so they are not silently run
+    with incorrect full-attention semantics.
+    """
+    if sliding_window is None:
+        return -1, -1
+    if not causal:
+        kv_lens = kv_lod_cpu[1:] - kv_lod_cpu[:-1]
+        if int(kv_lens.max().item()) <= sliding_window:
+            return -1, -1
+        return sliding_window, sliding_window
+    return sliding_window, 0
+
+
+def _noncausal_swa_token_ranges(
+    q_lod_cpu: torch.Tensor,
+    kv_lod_cpu: torch.Tensor,
+    window: int,
+) -> list[tuple[int, int, int]]:
+    """Return ``(global_q, global_k_start, global_k_end)`` per query token.
+
+    DFlash query tokens are aligned to the tail of each KV sequence.  Splitting
+    them into one-token dense-attention calls lets us express the exact
+    bidirectional window by slicing K/V, without XFA's broken positive
+    ``swa_right`` path or its explicit-mask path.
+    """
+    q_lod = q_lod_cpu.tolist()
+    kv_lod = kv_lod_cpu.tolist()
+    if len(q_lod) != len(kv_lod):
+        raise ValueError("Q and KV LoD must contain the same batch size")
+
+    ranges: list[tuple[int, int, int]] = []
+    for request_idx in range(len(q_lod) - 1):
+        q_start, q_end = q_lod[request_idx : request_idx + 2]
+        kv_start, kv_end = kv_lod[request_idx : request_idx + 2]
+        q_len = q_end - q_start
+        kv_len = kv_end - kv_start
+        if q_len <= 0 or q_len > kv_len:
+            raise ValueError(f"invalid DFlash lengths: q_len={q_len}, kv_len={kv_len}")
+        first_q_position = kv_len - q_len
+        for local_q in range(q_len):
+            q_position = first_q_position + local_q
+            local_k_start = max(0, q_position - window)
+            local_k_end = min(kv_len, q_position + window + 1)
+            ranges.append(
+                (q_start + local_q, kv_start + local_k_start, kv_start + local_k_end)
+            )
+    return ranges
+
+
+def _gather_paged_kv_for_prefill(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    kv_lod_cpu: torch.Tensor,
+    kv_lod_xpu: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather a possibly strided BHLD paged cache into token-major dense K/V."""
+    gather_cache = getattr(kunlun_ops, "gather_cache_mla", None)
+    if gather_cache is None:
+        raise RuntimeError(
+            "DFlash long-context SWA fallback requires "
+            "kunlun_ops.gather_cache_mla"
+        )
+
+    total_kv_tokens = int(kv_lod_cpu[-1].item())
+    num_kv_heads = key_cache.shape[1]
+    head_size = key_cache.shape[3]
+    dense_key = torch.empty(
+        (total_kv_tokens, num_kv_heads, head_size),
+        dtype=key_cache.dtype,
+        device=key_cache.device,
+    )
+    dense_value = torch.empty_like(dense_key)
+    batch_size = kv_lod_cpu.numel() - 1
+
+    # gather_cache_mla accepts explicit source block/entry strides and
+    # destination entry strides.  Calling it per KV head therefore supports
+    # both compact BHLD and vLLM's interleaved hybrid cache without copying the
+    # entire backing allocation.
+    for head_idx in range(num_kv_heads):
+        gather_cache(
+            key_cache[:, head_idx, :, :],
+            dense_key[:, head_idx, :],
+            block_tables,
+            kv_lod_xpu,
+            batch_size,
+        )
+        gather_cache(
+            value_cache[:, head_idx, :, :],
+            dense_value[:, head_idx, :],
+            block_tables,
+            kv_lod_xpu,
+            batch_size,
+        )
+    return dense_key, dense_value
+
+
+def _run_noncausal_swa_fallback(
+    *,
+    query: torch.Tensor,
+    output: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    q_lod_cpu: torch.Tensor,
+    kv_lod_cpu: torch.Tensor,
+    kv_lod_xpu: torch.Tensor,
+    window: int,
+    alibi_slopes: torch.Tensor | None,
+    sinks: torch.Tensor | None,
+) -> None:
+    """Exact long-context DFlash SWA fallback using dense no-SWA XFA calls."""
+    dense_key, dense_value = _gather_paged_kv_for_prefill(
+        key_cache,
+        value_cache,
+        block_tables,
+        kv_lod_cpu,
+        kv_lod_xpu,
+    )
+    q_lod_one_cpu = torch.tensor([0, 1], dtype=torch.int32)
+    q_lod_one_xpu = q_lod_one_cpu.to(query.device)
+    sink = sinks.to(torch.float32) if sinks is not None else None
+
+    for q_idx, k_start, k_end in _noncausal_swa_token_ranges(
+        q_lod_cpu, kv_lod_cpu, window
+    ):
+        kv_len = k_end - k_start
+        kv_lod_one_cpu = torch.tensor([0, kv_len], dtype=torch.int32)
+        kv_lod_one_xpu = kv_lod_one_cpu.to(query.device)
+        kunlun_ops.prefill_attention(
+            q=query[q_idx : q_idx + 1],
+            k=dense_key[k_start:k_end],
+            v=dense_value[k_start:k_end],
+            out=output[q_idx : q_idx + 1],
+            is_causal=False,
+            is_prefix_cache=False,
+            context_qlen_lod_cpu=q_lod_one_cpu,
+            context_qlen_lod_xpu=q_lod_one_xpu,
+            context_kvlen_lod_cpu=kv_lod_one_cpu,
+            context_kvlen_lod_xpu=kv_lod_one_xpu,
+            alibi_slopes=alibi_slopes,
+            softmax_lse=None,
+            swa_left=-1,
+            swa_right=-1,
+            sink=sink,
+        )
+
+
 class KunlunAttentionBackend(AttentionBackend):
     """KunlunAttentionBackend"""
 
     # crucial to cuda graph
     accept_output_buffer = True
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int]:
+        """Return XFA page sizes validated by the Kunlun attention paths.
+
+        This must be a list of fixed sizes rather than ``MultipleOf(1)``.  In
+        hybrid attention/Mamba models the KV manager can use a much larger
+        logical block (for example 512 tokens).  vLLM then splits each logical
+        block into 16- or 64-token kernel pages before calling XFA.
+        """
+        return [16, 64]
 
     @staticmethod
     def get_name() -> str:
@@ -86,6 +278,11 @@ class KunlunAttentionBackend(AttentionBackend):
     def get_builder_cls() -> type["KunlunAttentionMetadataBuilder"]:
         """get_builder_cls"""
         return KunlunAttentionMetadataBuilder
+
+    @classmethod
+    def supports_non_causal(cls) -> bool:
+        """Kunlun prefill attention supports bidirectional query blocks."""
+        return True
 
     @staticmethod
     def get_kv_cache_shape(
@@ -148,6 +345,9 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
 
     slot_mapping: torch.Tensor
     block_tables: torch.Tensor
+
+    # DFlash query blocks are bidirectional while normal decoding is causal.
+    causal: bool | torch.Tensor = True
 
     multi_modal_placeholder_index_maps: torch.Tensor | None = None
     # (batch_size,). The sequence length per sequence. Sequence length means
@@ -357,6 +557,7 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
             enable_kv_scales_calculation=False,
             use_cascade=self.use_cascade,
             is_speculative=self.is_speculative,
+            causal=self.causal,
         )
         return self._cached_prefill_metadata
 
@@ -431,6 +632,7 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
             use_cascade=self.use_cascade,
             is_speculative=self.is_speculative,
             max_model_len=self.max_model_len,
+            causal=self.causal,
         )
         return self._cached_decode_metadata
 
@@ -668,9 +870,17 @@ class KunlunAttentionMetadataBuilder:
         )
 
         seq_lens = common_attn_metadata.seq_lens
+        # ``CommonAttentionMetadata.seq_lens_cpu`` is deprecated because its
+        # lazy property hides a device-to-host synchronization. Reuse an
+        # existing host mirror when the runner supplied one; otherwise make
+        # the unavoidable transfer explicit before copying into our stable
+        # persistent buffer.
+        seq_lens_cpu_src = getattr(common_attn_metadata, "_seq_lens_cpu", None)
+        if seq_lens_cpu_src is None:
+            seq_lens_cpu_src = seq_lens.to("cpu")
         seq_lens_cpu = self._staged(
             "seq_lens_cpu",
-            common_attn_metadata.seq_lens_cpu,
+            seq_lens_cpu_src,
             num_reqs,
             "cpu",
             torch.int32,
@@ -685,7 +895,10 @@ class KunlunAttentionMetadataBuilder:
         kv_lod_cpu = self._staged_kv_lod(seq_lens_cpu, num_reqs)
         kv_lod_xpu = self._staged("kv_lod_xpu", kv_lod_cpu, num_reqs + 1, self.device)
 
-        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        # Non-causal DFlash query blocks must use the prefill kernel. The
+        # speculative decode kernel has no causality control.
+        is_non_causal = common_attn_metadata.causal is False
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=not is_non_causal)
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
                 common_attn_metadata,
@@ -735,6 +948,7 @@ class KunlunAttentionMetadataBuilder:
             use_cascade=use_cascade,
             is_speculative=self.reorder_batch_threshold > 1,
             max_model_len=self.vllm_config.model_config.max_model_len,
+            causal=common_attn_metadata.causal,
         )
         return attn_metadata
 
@@ -925,47 +1139,86 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
             # block stride. Scale logical block ids to match the actual
             # packed KV-cache block stride (e.g. 2 * attn_pack_size).
             block_table_scale = self._get_block_table_scale(key_cache)
-            tmp_block_tables = prefill_meta.block_tables * block_table_scale
+            swa_left, swa_right = _resolve_prefill_swa(
+                self.sliding_window,
+                bool(prefill_meta.causal),
+                prefill_meta.kv_lod_cpu,
+            )
 
             # Prefix cache or KV sharing layers (must read K/V from cache)
             if prefill_meta.query_start_loc_host[-1] != prefill_meta.kv_lod_cpu[-1]:
-                kunlun_ops.prefill_attention(
-                    q=prefill_query,
-                    k=key_cache,  # Key Cache [block_num, head, block_size, dim]
-                    v=value_cache,
-                    out=output[num_decode_tokens : attn_metadata.num_actual_tokens],
-                    is_causal=True,
-                    is_prefix_cache=True,
-                    block_table=tmp_block_tables,
-                    context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
-                    context_qlen_lod_xpu=prefill_meta.query_start_loc,
-                    context_kvlen_lod_cpu=prefill_meta.kv_lod_cpu,
-                    context_kvlen_lod_xpu=prefill_meta.kv_lod_xpu,
-                    alibi_slopes=self.alibi_slopes,
-                    softmax_lse=None,
-                    swa_left=(
-                        self.sliding_window if self.sliding_window is not None else -1
-                    ),
-                    swa_right=0 if self.sliding_window is not None else -1,
-                    sink=(
-                        self.sinks.to(torch.float32) if self.sinks is not None else None
-                    ),
+                # The input batch keeps a full-max-model-length block table.
+                # Prefix-prefill XFA only needs pages covering this batch's
+                # longest KV sequence; trim before applying the physical stride
+                # scale used by hybrid/packed caches.
+                logical_block_tables = _trim_prefill_block_tables(
+                    prefill_meta.block_tables,
+                    prefill_meta.kv_lod_cpu,
+                    key_cache.shape[2],
                 )
+                tmp_block_tables = logical_block_tables * block_table_scale
+                prefill_output = output[
+                    num_decode_tokens : attn_metadata.num_actual_tokens
+                ]
+                if swa_right > 0:
+                    # XFA faults for non-causal positive-right SWA, including
+                    # both paged and dense K/V.  Its explicit-mask path is also
+                    # unavailable in the affected operator build.  Gather the
+                    # strided paged cache once, then express the exact window
+                    # as one dense K/V slice per (small) DFlash query block.
+                    assert self.sliding_window is not None
+                    _run_noncausal_swa_fallback(
+                        query=prefill_query,
+                        output=prefill_output,
+                        key_cache=key_cache,
+                        value_cache=value_cache,
+                        block_tables=logical_block_tables,
+                        q_lod_cpu=prefill_meta.query_start_loc_host,
+                        kv_lod_cpu=prefill_meta.kv_lod_cpu,
+                        kv_lod_xpu=prefill_meta.kv_lod_xpu,
+                        window=self.sliding_window,
+                        alibi_slopes=self.alibi_slopes,
+                        sinks=self.sinks,
+                    )
+                else:
+                    kunlun_ops.prefill_attention(
+                        q=prefill_query,
+                        k=key_cache,  # Key Cache [block_num, head, block_size, dim]
+                        v=value_cache,
+                        out=prefill_output,
+                        is_causal=prefill_meta.causal,
+                        is_prefix_cache=True,
+                        block_table=tmp_block_tables,
+                        context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
+                        context_qlen_lod_xpu=prefill_meta.query_start_loc,
+                        context_kvlen_lod_cpu=prefill_meta.kv_lod_cpu,
+                        context_kvlen_lod_xpu=prefill_meta.kv_lod_xpu,
+                        alibi_slopes=self.alibi_slopes,
+                        softmax_lse=None,
+                        swa_left=swa_left,
+                        swa_right=swa_right,
+                        sink=(
+                            self.sinks.to(torch.float32)
+                            if self.sinks is not None
+                            else None
+                        ),
+                    )
             else:
+                prefill_output = output[
+                    num_decode_tokens : attn_metadata.num_actual_tokens
+                ]
                 kunlun_ops.prefill_attention(
                     q=prefill_query,
                     k=prefill_key,
                     v=prefill_value,
-                    out=output[num_decode_tokens : attn_metadata.num_actual_tokens],
-                    is_causal=True,
+                    out=prefill_output,
+                    is_causal=prefill_meta.causal,
                     context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
                     context_qlen_lod_xpu=prefill_meta.query_start_loc,
                     alibi_slopes=self.alibi_slopes,
                     softmax_lse=None,
-                    swa_left=(
-                        self.sliding_window if self.sliding_window is not None else -1
-                    ),
-                    swa_right=0 if self.sliding_window is not None else -1,
+                    swa_left=swa_left,
+                    swa_right=swa_right,
                     sink=(
                         self.sinks.to(torch.float32) if self.sinks is not None else None
                     ),
@@ -1105,6 +1358,27 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
 
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)
+
+    def do_kv_cache_update(
+        self,
+        layer: AttentionLayer,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Insert precomputed DFlash context K/V into the paged cache."""
+        if kv_cache.numel() == 0:
+            return
+        key_cache, value_cache = PagedAttention.split_kv_cache(kv_cache=kv_cache)
+        kunlun_ops.reshape_and_cache_flash(
+            key,
+            value.contiguous(),
+            key_cache,
+            value_cache,
+            slot_mapping,
+            BLHD_LAYOUT=False,
+        )
 
 
 def use_cascade_attention(

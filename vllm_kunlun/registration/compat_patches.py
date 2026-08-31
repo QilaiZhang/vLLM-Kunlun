@@ -93,6 +93,27 @@ def _apply_eagle_patch(module: ModuleType) -> None:
         import vllm_kunlun.v1.sample.spec_decode.eagle  # noqa: F401
 
 
+# --- vllm.v1.worker.gpu_model_runner: dispatch DFlash through Kunlun ------
+
+
+def _dflash_runner_applied(module: ModuleType) -> bool:
+    """Return whether the runner constructs the Kunlun DFlash proposer."""
+    cls = getattr(module, "DFlashProposer", None)
+    return cls is None or getattr(cls, "__module__", "").startswith("vllm_kunlun")
+
+
+def _apply_dflash_runner_patch(module: ModuleType) -> None:
+    """Replace the runner's imported proposer symbol after initialization."""
+    if not hasattr(module, "DFlashProposer"):
+        return
+    from vllm_kunlun.v1.sample.spec_decode.dflash import DFlashProposer
+
+    module.DFlashProposer = DFlashProposer
+    logging.getLogger("vllm_kunlun").info(
+        "[KunlunPlugin] GPUModelRunner DFlash proposer patched"
+    )
+
+
 # --- vllm.v1.spec_decode.suffix_decoding: pad dynamic drafts --------------
 
 
@@ -249,6 +270,20 @@ def _oot_registrations_applied(module: ModuleType) -> bool:
     # API, so there is nothing to register and the hook reports "done".
     if not hasattr(module, "CustomOp") or not hasattr(module, "PluggableLayer"):
         return True
+
+    # ``vllm.model_executor.layers.linear`` imports ``PluggableLayer`` near
+    # the top of the module, before defining WEIGHT_LOADER_V2_SUPPORTED. The
+    # import dispatcher therefore observes a fully initialized custom_op while
+    # linear is still only partially initialized. Importing vllm_kunlun.ops at
+    # that point would re-enter linear from vllm_kunlun.ops.linear and fail
+    # with a circular-import error. Report the hook as temporarily satisfied;
+    # dispatch_hooks() re-evaluates it after the outer linear import returns.
+    linear_module = sys.modules.get("vllm.model_executor.layers.linear")
+    if linear_module is None or not hasattr(
+        linear_module, "WEIGHT_LOADER_V2_SUPPORTED"
+    ):
+        return True
+
     ops_module = sys.modules.get("vllm_kunlun.ops")
     return bool(getattr(ops_module, "_KUNLUN_OOT_REGISTRATIONS_LOADED", False))
 
@@ -296,6 +331,11 @@ DEFAULT_HOOKS = (
     ),
     ("vllm.v1.worker.block_table", _block_table_applied, _apply_block_table_patch),
     ("vllm.v1.spec_decode.eagle", _eagle_applied, _apply_eagle_patch),
+    (
+        "vllm.v1.worker.gpu_model_runner",
+        _dflash_runner_applied,
+        _apply_dflash_runner_patch,
+    ),
     (
         "vllm.v1.spec_decode.suffix_decoding",
         _suffix_decoding_applied,

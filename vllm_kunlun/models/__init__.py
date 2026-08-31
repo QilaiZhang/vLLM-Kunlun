@@ -71,3 +71,8 @@ def register_model():
         "Qwen3_5MoeMTP",
         "vllm_kunlun.models.qwen3_5_mtp:Qwen3_5MoeMTP",
     )
+
+    ModelRegistry.register_model(
+        "DFlash2DraftModel",
+        "vllm_kunlun.models.qwen3_dflash2:DFlash2Qwen3ForCausalLM",
+    )
