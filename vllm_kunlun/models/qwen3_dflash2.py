@@ -7,9 +7,11 @@ from __future__ import annotations
 
 from threading import RLock
 
+import kunlun_ops
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.library import custom_op
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
@@ -169,6 +171,7 @@ def _make_conv_shift_matrices(
     return torch.tensor(matrices, dtype=dtype, device=device)
 
 
+@custom_op("vllm::dflash2_grouped_conv", mutates_args=())
 def _grouped_conv(
     hidden_states: torch.Tensor,
     delta: torch.Tensor,
@@ -180,57 +183,49 @@ def _grouped_conv(
     shift_matrices: torch.Tensor | None = None,
     keep_fp32_output: bool = False,
 ) -> torch.Tensor:
-    """Apply DFlash2's block-local dynamic grouped depthwise convolution."""
-    # Kunlun elementwise kernels require contiguous inputs in several eager /
-    # compiled paths. Attention and MLP outputs are not guaranteed to retain a
-    # contiguous layout, so normalize it at this boundary.
-    blocks = hidden_states.contiguous().unflatten(-1, (num_groups, group_size))
-
-    # Parallel drafting lays tokens out as fixed request blocks. Preserve that
-    # dimension explicitly so a shifted tap can never read the previous
-    # request. This also avoids device-side arange/bitwise/remainder operations,
-    # whose XMLIR implementations are not available on all Kunlun runtimes.
-    torch._check(hidden_states.shape[0] % block_size == 0)
-    block_count = hidden_states.shape[0] // block_size
-    blocked_states = blocks.reshape(block_count, block_size, num_groups, group_size)
-    blocked_delta = delta.unflatten(0, (block_count, block_size))
-    base_coefficients = base.reshape(taps, num_groups, group_size)
-    fp32_accumulation = hidden_states.dtype == torch.float16
-    if fp32_accumulation:
-        blocked_delta = blocked_delta.float()
-        base_coefficients = base_coefficients.float()
+    """Dispatch DFlash2's grouped convolution to the Kunlun operator."""
     if shift_matrices is None:
         shift_matrices = _make_conv_shift_matrices(
             block_size, taps, hidden_states.dtype, hidden_states.device
         )
-    blocked_states_flat = blocked_states.flatten(2)
+    return kunlun_ops.dflash_grouped_conv(
+        hidden_states,
+        delta,
+        base,
+        shift_matrices,
+        block_size,
+        num_groups,
+        group_size,
+        taps,
+        keep_fp32_output,
+    )
 
-    def contribution(tap: int, shifted: torch.Tensor) -> torch.Tensor:
-        # Distribute (base + delta) * shifted. Each broadcast multiply produces
-        # a full [B, L, G, S] result, so the following add is shape-matched.
-        # This avoids both the unsupported two-way broadcast add and the
-        # expand(...).contiguous() copy kernel used by the previous fallback.
-        if fp32_accumulation:
-            shifted = shifted.float()
-        base_part = shifted * base_coefficients[tap]
-        delta_part = shifted * blocked_delta[:, :, tap].unsqueeze(-1)
-        return base_part + delta_part
 
-    # Keep every accumulation out-of-place and exactly shape-matched. Kunlun's
-    # stack implementation lowers to the same unsupported copy kernel as cat,
-    # while the old in-place broadcast accumulation produced runtime error 719.
-    output = contribution(0, blocked_states)
-    for tap in range(1, taps):
-        # A tiny Toeplitz 0/1 matmul implements the block-local shift without
-        # invoking pad, gather, stack, or the backend's failing copy kernel.
-        shifted = torch.matmul(shift_matrices[tap], blocked_states_flat).unflatten(
-            -1, (num_groups, group_size)
-        )
-        output = output + contribution(tap, shifted)
-    output = output.flatten(0, 1).flatten(-2)
-    if fp32_accumulation and not keep_fp32_output:
-        output = output.to(hidden_states.dtype)
-    return output
+def _grouped_conv_fake(
+    hidden_states: torch.Tensor,
+    delta: torch.Tensor,
+    base: torch.Tensor,
+    block_size: int,
+    num_groups: int,
+    group_size: int,
+    taps: int,
+    shift_matrices: torch.Tensor | None = None,
+    keep_fp32_output: bool = False,
+) -> torch.Tensor:
+    del delta, base, block_size, num_groups, group_size, taps, shift_matrices
+    output_dtype = (
+        torch.float32
+        if keep_fp32_output and hidden_states.dtype == torch.float16
+        else hidden_states.dtype
+    )
+    return torch.empty(
+        hidden_states.shape,
+        dtype=output_dtype,
+        device=hidden_states.device,
+    )
+
+
+_grouped_conv.register_fake(_grouped_conv_fake)
 
 
 class DFlashGroupedConv(nn.Module):
