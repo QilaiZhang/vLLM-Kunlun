@@ -74,15 +74,9 @@ def _resolve_prefill_swa(
 ) -> tuple[int, int]:
     """Translate vLLM SWA metadata to the XFA prefill contract.
 
-    XFA currently faults for cache-backed, non-causal attention when a
-    positive right window is supplied.  If every KV sequence is shorter than
-    the configured window, SWA is mathematically identical to full attention,
-    so omit both window arguments.  This is the common early DFlash proposal
-    path and avoids the unsupported kernel branch without changing results.
-
-    Longer non-causal windows still need an operator-side fix (or an explicit
-    mask fallback); keep their arguments intact so they are not silently run
-    with incorrect full-attention semantics.
+    If every KV sequence is shorter than the configured window, SWA is
+    mathematically identical to full attention, so omit both window arguments.
+    Longer non-causal windows use XFA's paged bidirectional SWA path directly.
     """
     if sliding_window is None:
         return -1, -1
@@ -92,142 +86,6 @@ def _resolve_prefill_swa(
             return -1, -1
         return sliding_window, sliding_window
     return sliding_window, 0
-
-
-def _noncausal_swa_token_ranges(
-    q_lod_cpu: torch.Tensor,
-    kv_lod_cpu: torch.Tensor,
-    window: int,
-) -> list[tuple[int, int, int]]:
-    """Return ``(global_q, global_k_start, global_k_end)`` per query token.
-
-    DFlash query tokens are aligned to the tail of each KV sequence.  Splitting
-    them into one-token dense-attention calls lets us express the exact
-    bidirectional window by slicing K/V, without XFA's broken positive
-    ``swa_right`` path or its explicit-mask path.
-    """
-    q_lod = q_lod_cpu.tolist()
-    kv_lod = kv_lod_cpu.tolist()
-    if len(q_lod) != len(kv_lod):
-        raise ValueError("Q and KV LoD must contain the same batch size")
-
-    ranges: list[tuple[int, int, int]] = []
-    for request_idx in range(len(q_lod) - 1):
-        q_start, q_end = q_lod[request_idx : request_idx + 2]
-        kv_start, kv_end = kv_lod[request_idx : request_idx + 2]
-        q_len = q_end - q_start
-        kv_len = kv_end - kv_start
-        if q_len <= 0 or q_len > kv_len:
-            raise ValueError(f"invalid DFlash lengths: q_len={q_len}, kv_len={kv_len}")
-        first_q_position = kv_len - q_len
-        for local_q in range(q_len):
-            q_position = first_q_position + local_q
-            local_k_start = max(0, q_position - window)
-            local_k_end = min(kv_len, q_position + window + 1)
-            ranges.append(
-                (q_start + local_q, kv_start + local_k_start, kv_start + local_k_end)
-            )
-    return ranges
-
-
-def _gather_paged_kv_for_prefill(
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    block_tables: torch.Tensor,
-    kv_lod_cpu: torch.Tensor,
-    kv_lod_xpu: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Gather a possibly strided BHLD paged cache into token-major dense K/V."""
-    gather_cache = getattr(kunlun_ops, "gather_cache_mla", None)
-    if gather_cache is None:
-        raise RuntimeError(
-            "DFlash long-context SWA fallback requires " "kunlun_ops.gather_cache_mla"
-        )
-
-    total_kv_tokens = int(kv_lod_cpu[-1].item())
-    num_kv_heads = key_cache.shape[1]
-    head_size = key_cache.shape[3]
-    dense_key = torch.empty(
-        (total_kv_tokens, num_kv_heads, head_size),
-        dtype=key_cache.dtype,
-        device=key_cache.device,
-    )
-    dense_value = torch.empty_like(dense_key)
-    batch_size = kv_lod_cpu.numel() - 1
-
-    # gather_cache_mla accepts explicit source block/entry strides and
-    # destination entry strides.  Calling it per KV head therefore supports
-    # both compact BHLD and vLLM's interleaved hybrid cache without copying the
-    # entire backing allocation.
-    for head_idx in range(num_kv_heads):
-        gather_cache(
-            key_cache[:, head_idx, :, :],
-            dense_key[:, head_idx, :],
-            block_tables,
-            kv_lod_xpu,
-            batch_size,
-        )
-        gather_cache(
-            value_cache[:, head_idx, :, :],
-            dense_value[:, head_idx, :],
-            block_tables,
-            kv_lod_xpu,
-            batch_size,
-        )
-    return dense_key, dense_value
-
-
-def _run_noncausal_swa_fallback(
-    *,
-    query: torch.Tensor,
-    output: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    block_tables: torch.Tensor,
-    q_lod_cpu: torch.Tensor,
-    kv_lod_cpu: torch.Tensor,
-    kv_lod_xpu: torch.Tensor,
-    window: int,
-    alibi_slopes: torch.Tensor | None,
-    sinks: torch.Tensor | None,
-    alpha: float = 1.0,
-) -> None:
-    """Exact long-context DFlash SWA fallback using dense no-SWA XFA calls."""
-    dense_key, dense_value = _gather_paged_kv_for_prefill(
-        key_cache,
-        value_cache,
-        block_tables,
-        kv_lod_cpu,
-        kv_lod_xpu,
-    )
-    q_lod_one_cpu = torch.tensor([0, 1], dtype=torch.int32)
-    q_lod_one_xpu = q_lod_one_cpu.to(query.device)
-    sink = sinks.to(torch.float32) if sinks is not None else None
-
-    for q_idx, k_start, k_end in _noncausal_swa_token_ranges(
-        q_lod_cpu, kv_lod_cpu, window
-    ):
-        kv_len = k_end - k_start
-        kv_lod_one_cpu = torch.tensor([0, kv_len], dtype=torch.int32)
-        kv_lod_one_xpu = kv_lod_one_cpu.to(query.device)
-        kunlun_ops.prefill_attention(
-            q=query[q_idx : q_idx + 1],
-            k=dense_key[k_start:k_end],
-            v=dense_value[k_start:k_end],
-            out=output[q_idx : q_idx + 1],
-            is_causal=False,
-            alpha=alpha,
-            is_prefix_cache=False,
-            context_qlen_lod_cpu=q_lod_one_cpu,
-            context_qlen_lod_xpu=q_lod_one_xpu,
-            context_kvlen_lod_cpu=kv_lod_one_cpu,
-            context_kvlen_lod_xpu=kv_lod_one_xpu,
-            alibi_slopes=alibi_slopes,
-            softmax_lse=None,
-            swa_left=-1,
-            swa_right=-1,
-            sink=sink,
-        )
 
 
 class KunlunAttentionBackend(AttentionBackend):
@@ -1169,47 +1027,25 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                 prefill_output = output[
                     num_decode_tokens : attn_metadata.num_actual_tokens
                 ]
-                if swa_right > 0:
-                    # XFA faults for non-causal positive-right SWA, including
-                    # both paged and dense K/V.  Its explicit-mask path is also
-                    # unavailable in the affected operator build.  Gather the
-                    # strided paged cache once, then express the exact window
-                    # as one dense K/V slice per (small) DFlash query block.
-                    assert self.sliding_window is not None
-                    _run_noncausal_swa_fallback(
-                        query=prefill_query,
-                        output=prefill_output,
-                        key_cache=key_cache,
-                        value_cache=value_cache,
-                        block_tables=logical_block_tables,
-                        q_lod_cpu=prefill_meta.query_start_loc_host,
-                        kv_lod_cpu=prefill_meta.kv_lod_cpu,
-                        kv_lod_xpu=prefill_meta.kv_lod_xpu,
-                        window=self.sliding_window,
-                        alibi_slopes=self.alibi_slopes,
-                        sinks=self._get_sinks_fp32(),
-                        alpha=self.prefill_alpha,
-                    )
-                else:
-                    kunlun_ops.prefill_attention(
-                        q=prefill_query,
-                        k=key_cache,  # Key Cache [block_num, head, block_size, dim]
-                        v=value_cache,
-                        out=prefill_output,
-                        is_causal=prefill_meta.causal,
-                        alpha=self.prefill_alpha,
-                        is_prefix_cache=True,
-                        block_table=tmp_block_tables,
-                        context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
-                        context_qlen_lod_xpu=prefill_meta.query_start_loc,
-                        context_kvlen_lod_cpu=prefill_meta.kv_lod_cpu,
-                        context_kvlen_lod_xpu=prefill_meta.kv_lod_xpu,
-                        alibi_slopes=self.alibi_slopes,
-                        softmax_lse=None,
-                        swa_left=swa_left,
-                        swa_right=swa_right,
-                        sink=self._get_sinks_fp32(),
-                    )
+                kunlun_ops.prefill_attention(
+                    q=prefill_query,
+                    k=key_cache,  # Key Cache [block_num, head, block_size, dim]
+                    v=value_cache,
+                    out=prefill_output,
+                    is_causal=prefill_meta.causal,
+                    alpha=self.prefill_alpha,
+                    is_prefix_cache=True,
+                    block_table=tmp_block_tables,
+                    context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
+                    context_qlen_lod_xpu=prefill_meta.query_start_loc,
+                    context_kvlen_lod_cpu=prefill_meta.kv_lod_cpu,
+                    context_kvlen_lod_xpu=prefill_meta.kv_lod_xpu,
+                    alibi_slopes=self.alibi_slopes,
+                    softmax_lse=None,
+                    swa_left=swa_left,
+                    swa_right=swa_right,
+                    sink=self._get_sinks_fp32(),
+                )
             else:
                 prefill_output = output[
                     num_decode_tokens : attn_metadata.num_actual_tokens
