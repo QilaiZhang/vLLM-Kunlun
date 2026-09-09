@@ -10,8 +10,10 @@ Mamba needs the first behavior in align mode, but not the second: draft models
 do not contain Mamba layers and ``MambaManager`` cannot pop its sole state
 block. Keep Mamba managers enrolled in EAGLE cache writes, while excluding
 Mamba only from the extra-block lookup. Also let full attention peek beyond
-``max_cache_hit_length``; the request's block-hash list is the real bound and
-the EAGLE pop brings the result back to the legal hit boundary.
+``max_cache_hit_length`` when the request's block-hash list contains that
+lookahead block; the EAGLE pop brings the result back to the legal hit
+boundary. Chunked prefill can provide fewer hashes, so every lookup is capped
+to the converted hash list's actual token coverage.
 
 Off switch: ``VLLM_KUNLUN_MAMBA_EAGLE_GROUP_FIX=0``.
 """
@@ -30,6 +32,15 @@ _orig_find_longest_cache_hit = HybridKVCacheCoordinator.find_longest_cache_hit
 
 def _enabled() -> bool:
     return os.getenv("VLLM_KUNLUN_MAMBA_EAGLE_GROUP_FIX", "1") == "1"
+
+
+def _cap_lookup_length_to_hashes(
+    requested_length: int,
+    block_hashes,
+    block_size: int,
+) -> int:
+    """Keep cache-hit managers from indexing beyond available block hashes."""
+    return min(requested_length, len(block_hashes) * block_size)
 
 
 def _patched_find_longest_cache_hit(self, block_hashes, max_cache_hit_length):
@@ -81,8 +92,14 @@ def _patched_find_longest_cache_hit(self, block_hashes, max_cache_hit_length):
                 # the valid boundary.
                 lookup_length = curr_hit_length + spec.block_size
 
+            spec_block_hashes = _get_block_hashes(spec)
+            lookup_length = _cap_lookup_length_to_hashes(
+                lookup_length,
+                spec_block_hashes,
+                spec.block_size,
+            )
             hit_blocks = manager_cls.find_longest_cache_hit(
-                block_hashes=_get_block_hashes(spec),
+                block_hashes=spec_block_hashes,
                 max_length=lookup_length,
                 kv_cache_group_ids=group_ids,
                 block_pool=self.block_pool,
