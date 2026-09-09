@@ -5,6 +5,7 @@
 import os
 from dataclasses import replace
 
+import kunlun_ops
 import numpy as np
 import torch
 from vllm.compilation import monitor
@@ -67,7 +68,7 @@ def prepare_next_token_ids_padded(
     gpu_input_batch: InputBatch,
     discard_request_mask: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Torch-native replacement (Qwen3.5-MTP) for the Triton kernel
+    """Kunlun operator replacement (Qwen3.5-MTP) for the Triton kernel
     ``eagle_prepare_next_token_padded_kernel``。
     """
     if not _is_qwen35_mtp(self):
@@ -92,38 +93,22 @@ def prepare_next_token_ids_padded(
     )
     self.backup_next_token_ids.copy_to_gpu(num_reqs)
 
-    # Mask out discarded requests' sampled tokens.
-    discard_sampled_tokens_req_indices = torch.nonzero(
-        discard_request_mask[:num_reqs], as_tuple=False
-    ).flatten()
-
-    valid_sampled_token_ids_gpu = sampled_token_ids.clone()
-
-    if discard_sampled_tokens_req_indices.numel() > 0:
-        idx = discard_sampled_tokens_req_indices
-        if idx.device != valid_sampled_token_ids_gpu.device:
-            idx = idx.to(valid_sampled_token_ids_gpu.device, non_blocking=True)
-        if idx.dtype != torch.long:
-            idx = idx.to(torch.long)
-        valid_sampled_token_ids_gpu.index_fill_(0, idx, -1)
-
-    valid_mask = (valid_sampled_token_ids_gpu != -1) & (
-        valid_sampled_token_ids_gpu < gpu_input_batch.vocab_size
+    batch_size, num_tokens = sampled_token_ids.shape
+    assert batch_size == num_reqs
+    next_token_ids = torch.empty(
+        batch_size, dtype=torch.int32, device=sampled_token_ids.device
     )
-    valid_sampled_tokens_count_long = valid_mask.sum(dim=1)
-    valid_sampled_tokens_count = valid_sampled_tokens_count_long.to(torch.int32)
+    valid_sampled_tokens_count = next_token_ids.new_empty(batch_size)
 
-    last_valid_indices = valid_sampled_tokens_count_long - 1
-    last_valid_indices_safe = torch.clamp(last_valid_indices, min=0)
-    selected_tokens = torch.gather(
-        valid_sampled_token_ids_gpu, 1, last_valid_indices_safe.unsqueeze(1)
-    ).squeeze(1)
-
-    batch_size = valid_sampled_token_ids_gpu.shape[0]
-    next_token_ids = torch.where(
-        last_valid_indices != -1,
-        selected_tokens,
+    kunlun_ops.eagle_prepare_next_token_padded(
+        sampled_token_ids,
+        discard_request_mask[:batch_size],
         self.backup_next_token_ids.gpu[:batch_size],
+        next_token_ids,
+        valid_sampled_tokens_count,
+        gpu_input_batch.vocab_size,
+        num_tokens,
+        batch_size,
     )
 
     return next_token_ids, valid_sampled_tokens_count
@@ -135,7 +120,7 @@ def prepare_inputs_padded(
     spec_decode_metadata: SpecDecodeMetadata,
     valid_sampled_tokens_count: torch.Tensor,
 ) -> tuple[CommonAttentionMetadata, torch.Tensor, torch.Tensor]:
-    """Torch-native replacement (仅 Qwen3.5-MTP) for the Triton kernel
+    """Kunlun operator replacement (仅 Qwen3.5-MTP) for the Triton kernel
     ``eagle_prepare_inputs_padded_kernel``"""
     if not _is_qwen35_mtp(self):
         return _orig_prepare_inputs_padded(
@@ -146,21 +131,18 @@ def prepare_inputs_padded(
         )
 
     num_reqs = common_attn_metadata.num_reqs
+    device = valid_sampled_tokens_count.device
+    token_indices_to_sample = torch.empty((num_reqs,), dtype=torch.int32, device=device)
+    num_rejected_tokens_gpu = torch.empty((num_reqs,), dtype=torch.int32, device=device)
 
-    cu_num_draft = spec_decode_metadata.cu_num_draft_tokens
-    num_draft = cu_num_draft.clone()
-    if num_reqs > 1:
-        num_draft[1:] = cu_num_draft[1:] - cu_num_draft[:-1]
-
-    valid_count = valid_sampled_tokens_count.to(num_draft.dtype)
-    num_rejected = num_draft + 1 - valid_count
-    num_rejected = torch.where(
-        num_draft > 0, num_rejected, torch.zeros_like(num_rejected)
+    kunlun_ops.eagle_prepare_inputs_padded_v2(
+        spec_decode_metadata.cu_num_draft_tokens[:num_reqs],
+        valid_sampled_tokens_count[:num_reqs],
+        common_attn_metadata.query_start_loc[: num_reqs + 1],
+        token_indices_to_sample,
+        num_rejected_tokens_gpu,
+        num_reqs,
     )
-
-    q_last_tok_idx = common_attn_metadata.query_start_loc[1:] - 1
-    token_indices_to_sample = (q_last_tok_idx - num_rejected).to(torch.int32)
-    num_rejected_tokens_gpu = num_rejected.to(torch.int32)
 
     query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
     new_query_len_per_req = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
