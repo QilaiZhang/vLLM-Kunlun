@@ -63,15 +63,19 @@ def get_masked_input_and_mask(
     added_vocab_start_index: int,
     added_vocab_end_index: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # The fused kernel accepts only a dense 1D int32 token array. Embedding callers
+    # may pass batched/block-shaped IDs (e.g. speculative decoding).
+    input_shape = input_.shape
+    input_dtype = input_.dtype
     input_, vocab_mask = torch.ops.xspeedgate_ops.get_masked_input_and_mask(
-        input_,
+        input_.reshape(-1).to(dtype=torch.int32).contiguous(),
         org_vocab_start_index,
         org_vocab_end_index,
         num_org_vocab_padding,
         added_vocab_start_index,
         added_vocab_end_index,
     )
-    return input_, vocab_mask
+    return input_.to(dtype=input_dtype).reshape(input_shape), vocab_mask.reshape(input_shape)
 
 
 # =============================================================================
