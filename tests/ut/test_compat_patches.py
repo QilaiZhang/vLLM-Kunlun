@@ -170,15 +170,30 @@ class TestOotRegistrations:
         assert compat_patches._oot_registrations_applied(module) is True
 
     def test_pending_when_the_ops_package_has_not_registered(
-        self, module_factory, sys_modules_guard
+        self, module_factory, sys_modules_guard, stub_module
     ):
         sys.modules.pop("vllm_kunlun.ops", None)
+        stub_module("vllm.model_executor.layers.linear", WEIGHT_LOADER_V2_SUPPORTED=[])
         module = module_factory(CustomOp=object(), PluggableLayer=object())
 
         assert compat_patches._oot_registrations_applied(module) is False
 
     def test_done_once_the_ops_package_marks_itself(self, module_factory, stub_module):
+        stub_module("vllm.model_executor.layers.linear", WEIGHT_LOADER_V2_SUPPORTED=[])
         stub_module("vllm_kunlun.ops", _KUNLUN_OOT_REGISTRATIONS_LOADED=True)
         module = module_factory(CustomOp=object(), PluggableLayer=object())
 
         assert compat_patches._oot_registrations_applied(module) is True
+
+    def test_registration_waits_for_linear_import_to_finish(
+        self, module_factory, stub_module, sys_modules_guard
+    ):
+        sys.modules.pop("vllm_kunlun.ops", None)
+        linear = stub_module("vllm.model_executor.layers.linear")
+        module = module_factory(CustomOp=object(), PluggableLayer=object())
+
+        assert compat_patches._oot_registrations_applied(module) is True
+
+        linear.WEIGHT_LOADER_V2_SUPPORTED = []
+
+        assert compat_patches._oot_registrations_applied(module) is False
