@@ -24,6 +24,7 @@ import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -140,8 +141,7 @@ def _gather_paged_kv_for_prefill(
     gather_cache = getattr(kunlun_ops, "gather_cache_mla", None)
     if gather_cache is None:
         raise RuntimeError(
-            "DFlash long-context SWA fallback requires "
-            "kunlun_ops.gather_cache_mla"
+            "DFlash long-context SWA fallback requires " "kunlun_ops.gather_cache_mla"
         )
 
     total_kv_tokens = int(kv_lod_cpu[-1].item())
@@ -890,12 +890,15 @@ class KunlunAttentionMetadataBuilder:
         # speculative decode kernel has no causality control.
         is_non_causal = common_attn_metadata.causal is False
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=not is_non_causal)
-        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-            split_decodes_and_prefills(
-                common_attn_metadata,
-                decode_threshold=self.reorder_batch_threshold or 1,
-                require_uniform=True,
-            )
+        (
+            num_decodes,
+            num_prefills,
+            num_decode_tokens,
+            num_prefill_tokens,
+        ) = split_decodes_and_prefills(
+            common_attn_metadata,
+            decode_threshold=self.reorder_batch_threshold or 1,
+            require_uniform=True,
         )
 
         if num_prefill_tokens > 0:

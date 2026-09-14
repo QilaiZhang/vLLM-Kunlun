@@ -2,7 +2,6 @@ from vllm import ModelRegistry
 
 
 def register_model():
-
     # TODO Remove all of models registration below
 
     # from .demo_model import DemoModel
