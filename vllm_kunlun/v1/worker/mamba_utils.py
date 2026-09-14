@@ -12,18 +12,17 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
+import torch
+import vllm.v1.worker.mamba_utils as _up
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     get_conv_copy_spec,
     get_temporal_copy_spec,
     is_conv_state_dim_first,
 )
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.utils import CpuGpuBuffer
-from vllm.v1.core.sched.output import SchedulerOutput
-
-import torch
-import vllm.v1.worker.mamba_utils as _up
 
 logger = logging.getLogger("vllm_kunlun")
 
@@ -32,11 +31,8 @@ def batch_memcpy(src_ptrs, dst_ptrs, sizes):
     """xspeedgate stand-in for upstream's Triton ``batch_memcpy_kernel``.
 
     ``xspeedgate_ops.batch_memcpy`` is specified for int64 pointer and size
-    tensors, and every buffer that reaches it comes from the
-    ``MambaCopyBuffers.create`` override below, which allocates exactly that:
-    the op has a single call path (upstream ``preprocess_mamba`` ->
-    ``do_mamba_copy_block``), and ``MambaCopyBuffers`` has a single construction
-    site (upstream ``MambaBuffers.create``), which goes through the override.
+    tensors. Both the ``MambaCopyBuffers.create`` override below and the
+    speculative postprocess context construct buffers with those dtypes.
 
     The dtypes are therefore asserted rather than coerced. An earlier version
     reinterpreted mismatches with ``Tensor.view``, which is only lossless
@@ -324,9 +320,7 @@ class MambaSpecDecodeGPUContext:
         state_is_conv_host: list[bool] = []
         idx = 0
         for group_local_idx, mamba_group_id in enumerate(self.mamba_group_ids):
-            layer_names = kv_cache_config.kv_cache_groups[
-                mamba_group_id
-            ].layer_names
+            layer_names = kv_cache_config.kv_cache_groups[mamba_group_id].layer_names
             for layer_name in layer_names:
                 kv_caches: list[torch.Tensor] = forward_context[layer_name].kv_cache
                 if len(kv_caches) != self.num_state_types:
@@ -346,9 +340,7 @@ class MambaSpecDecodeGPUContext:
                         )
 
                     elem_size = state.element_size()
-                    block_stride = (
-                        state.stride(0) if state.dim() > 1 else state.numel()
-                    )
+                    block_stride = state.stride(0) if state.dim() > 1 else state.numel()
                     self.state_base_addrs[idx] = state.data_ptr()
                     self.state_block_strides[idx] = block_stride * elem_size
                     self.state_elem_sizes[idx] = elem_size
@@ -368,8 +360,7 @@ class MambaSpecDecodeGPUContext:
         strides = {table.stride(0) for table in block_tables}
         if len(strides) != 1:
             raise ValueError(
-                "all Mamba block tables must share stride(0), "
-                f"got {strides}"
+                "all Mamba block tables must share stride(0), " f"got {strides}"
             )
         self.block_table_stride_req = int(next(iter(strides)))
         full_block_tables: list[torch.Tensor] = []
@@ -403,9 +394,7 @@ class MambaSpecDecodeGPUContext:
         if num_reqs == 0 or not self.is_initialized:
             return
         if num_reqs > self.max_num_reqs:
-            raise ValueError(
-                f"num_reqs {num_reqs} exceeds maximum {self.max_num_reqs}"
-            )
+            raise ValueError(f"num_reqs {num_reqs} exceeds maximum {self.max_num_reqs}")
 
         accepted = num_accepted_tokens_gpu[:num_reqs].to(torch.int64)
         src_col = mamba_state_idx_gpu[:num_reqs].to(torch.int64)
@@ -424,9 +413,7 @@ class MambaSpecDecodeGPUContext:
         accepted_out = torch.where(
             needs_copy & same_col, torch.ones_like(accepted), accepted
         )
-        self.num_accepted_tokens_out[:num_reqs].copy_(
-            accepted_out.to(torch.int32)
-        )
+        self.num_accepted_tokens_out[:num_reqs].copy_(accepted_out.to(torch.int32))
         copy_mask = needs_copy & ~(same_col & (token_bias == 0))
 
         rows = torch.arange(
@@ -462,8 +449,7 @@ class MambaSpecDecodeGPUContext:
                     + token_bias * inner_size * elem_size
                 )
                 size = (
-                    (self.state_conv_widths[state_idx] - token_bias)
-                    .clamp_min(0)
+                    (self.state_conv_widths[state_idx] - token_bias).clamp_min(0)
                     * inner_size
                     * elem_size
                 )
