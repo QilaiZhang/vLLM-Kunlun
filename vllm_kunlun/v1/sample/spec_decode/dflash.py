@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import kunlun_ops
 import numpy as np
 import torch
 from torch import nn
@@ -177,7 +178,7 @@ class DFlashProposer(UpstreamDFlashProposer):
         gpu_input_batch: InputBatch,
         discard_request_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Torch replacement for vLLM's Triton padded-token kernel."""
+        """Prepare padded tokens with the Kunlun EAGLE kernel."""
         num_reqs = gpu_input_batch.num_reqs
         self.backup_next_token_ids.np[:num_reqs] = np.asarray(
             [
@@ -190,44 +191,22 @@ class DFlashProposer(UpstreamDFlashProposer):
         )
         self.backup_next_token_ids.copy_to_gpu(num_reqs)
 
-        # A discarded row must use its target-side backup token regardless of
-        # the sampled contents. Mark the whole row invalid before counting.
-        valid_sampled_token_ids = sampled_token_ids.clone()
-        discarded = torch.nonzero(
-            discard_request_mask[:num_reqs], as_tuple=False
-        ).flatten()
-        if discarded.numel() > 0:
-            discarded = discarded.to(
-                device=valid_sampled_token_ids.device,
-                dtype=torch.long,
-                non_blocking=True,
-            )
-            valid_sampled_token_ids.index_fill_(0, discarded, -1)
-
-        valid_mask = (valid_sampled_token_ids != -1) & (
-            valid_sampled_token_ids < gpu_input_batch.vocab_size
+        batch_size, num_tokens = sampled_token_ids.shape
+        assert batch_size == num_reqs
+        next_token_ids = torch.empty(
+            batch_size, dtype=torch.int32, device=sampled_token_ids.device
         )
-        valid_count_long = valid_mask.sum(dim=1)
-        valid_sampled_tokens_count = valid_count_long.to(torch.int32)
+        valid_sampled_tokens_count = next_token_ids.new_empty(batch_size)
 
-        # Rejections are padded with -1, but use the mask rather than assuming
-        # they form a contiguous suffix so this matches the Triton reference.
-        token_columns = torch.arange(
-            valid_sampled_token_ids.shape[1],
-            device=valid_sampled_token_ids.device,
-        )
-        last_valid_indices = torch.where(
-            valid_mask,
-            token_columns[None, :],
-            token_columns.new_full((), -1),
-        ).amax(dim=1)
-        safe_indices = last_valid_indices.clamp_min(0)
-        last_valid_tokens = valid_sampled_token_ids.gather(
-            1, safe_indices[:, None]
-        ).squeeze(1)
-        backup_tokens = self.backup_next_token_ids.gpu[:num_reqs]
-        next_token_ids = torch.where(
-            last_valid_indices >= 0, last_valid_tokens, backup_tokens
+        kunlun_ops.eagle_prepare_next_token_padded(
+            sampled_token_ids,
+            discard_request_mask[:batch_size],
+            self.backup_next_token_ids.gpu[:batch_size],
+            next_token_ids,
+            valid_sampled_tokens_count,
+            gpu_input_batch.vocab_size,
+            num_tokens,
+            batch_size,
         )
         return next_token_ids, valid_sampled_tokens_count
 
