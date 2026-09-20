@@ -219,6 +219,36 @@ def _apply_minimax_rms_norm_tp_patch(module: ModuleType) -> None:
     )
 
 
+# --- vllm.v1.worker.gpu_input_batch: expose the CPU top-k bound -----------
+
+
+def _input_batch_top_k_bound_applied(module: ModuleType) -> bool:
+    cls = getattr(module, "InputBatch", None)
+    fn = getattr(cls, "_make_sampling_metadata", None)
+    return fn is None or getattr(fn, "_kunlun_top_k_bound_patched", False)
+
+
+def _apply_input_batch_top_k_bound(module: ModuleType) -> None:
+    cls = getattr(module, "InputBatch", None)
+    original = getattr(cls, "_make_sampling_metadata", None)
+    if original is None or getattr(original, "_kunlun_top_k_bound_patched", False):
+        return
+
+    @functools.wraps(original)
+    def _make_sampling_metadata(self):
+        metadata = original(self)
+        num_reqs = self.num_reqs
+        metadata.max_top_k = (
+            int(self.top_k_cpu[:num_reqs].max())
+            if num_reqs and not self.no_top_k
+            else None
+        )
+        return metadata
+
+    _make_sampling_metadata._kunlun_top_k_bound_patched = True
+    cls._make_sampling_metadata = _make_sampling_metadata
+
+
 # --- vllm.v1.worker.block_table: patch slot-mapping computation -----------
 
 
@@ -686,6 +716,11 @@ _V2_PATCHES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 # (target module, is_applied, apply_patch) triples registered by import_hooks.
 DEFAULT_HOOKS = (
     ("vllm.config.vllm", _mrv2_gate_applied, _apply_mrv2_gate),
+    (
+        "vllm.v1.worker.gpu_input_batch",
+        _input_batch_top_k_bound_applied,
+        _apply_input_batch_top_k_bound,
+    ),
     (
         "vllm.utils.import_utils",
         _optional_dep_probe_applied,
