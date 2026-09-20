@@ -217,25 +217,22 @@ class DFlashProposer(UpstreamDFlashProposer):
         spec_decode_metadata: SpecDecodeMetadata,
         valid_sampled_tokens_count: torch.Tensor,
     ) -> tuple[CommonAttentionMetadata, torch.Tensor, torch.Tensor]:
-        """Torch replacement for vLLM's Triton padded-input kernel."""
+        """Prepare padded inputs with the Kunlun EAGLE kernel."""
         num_reqs = common_attn_metadata.num_reqs
-        cumulative_draft_tokens = spec_decode_metadata.cu_num_draft_tokens
-        num_draft_tokens = cumulative_draft_tokens.clone()
-        if num_reqs > 1:
-            num_draft_tokens[1:] = (
-                cumulative_draft_tokens[1:] - cumulative_draft_tokens[:-1]
-            )
-
-        valid_count = valid_sampled_tokens_count.to(num_draft_tokens.dtype)
-        num_rejected_tokens = num_draft_tokens + 1 - valid_count
-        num_rejected_tokens = torch.where(
-            num_draft_tokens > 0,
-            num_rejected_tokens,
-            torch.zeros_like(num_rejected_tokens),
-        ).to(torch.int32)
-        last_query_token = common_attn_metadata.query_start_loc[1:] - 1
-        token_indices_to_sample = (last_query_token - num_rejected_tokens).to(
-            torch.int32
+        device = valid_sampled_tokens_count.device
+        token_indices_to_sample = torch.empty(
+            (num_reqs,), dtype=torch.int32, device=device
+        )
+        num_rejected_tokens_gpu = torch.empty(
+            (num_reqs,), dtype=torch.int32, device=device
+        )
+        kunlun_ops.eagle_prepare_inputs_padded_v2(
+            spec_decode_metadata.cu_num_draft_tokens[:num_reqs],
+            valid_sampled_tokens_count[:num_reqs],
+            common_attn_metadata.query_start_loc[: num_reqs + 1],
+            token_indices_to_sample,
+            num_rejected_tokens_gpu,
+            num_reqs,
         )
 
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
@@ -260,7 +257,7 @@ class DFlashProposer(UpstreamDFlashProposer):
         return (
             padded_metadata,
             token_indices_to_sample,
-            num_rejected_tokens,
+            num_rejected_tokens_gpu,
         )
 
     @override
