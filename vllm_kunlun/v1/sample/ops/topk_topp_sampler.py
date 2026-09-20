@@ -123,19 +123,22 @@ def apply_top_k_top_p_optimized(
     k: torch.Tensor | None,
     p: torch.Tensor | None,
     max_select_k: int = 8192,
+    max_top_k: int | None = None,
 ) -> torch.Tensor:
     """Sort-free top-k + top-p, mathematically identical to
     :func:`apply_top_k_top_p` (same surviving token set, bit-identical probs).
 
-    Two strategies, picked by whether a small top-k window is available:
+    Two strategies, picked by whether a small top-k window is available.
+    ``max_top_k`` is an optional host-side upper bound for ``k``; without it,
+    use the full-vocabulary fallback rather than reading ``k`` on the host:
 
-    1. ``k`` given and ``max(k) <= max_select_k``: a single
+    1. ``k`` given and ``max_top_k <= max_select_k``: a single
        ``topk(select_k)`` (select_k << V) yields a window that provably
        contains every row's kept set, so top-p only needs a sorted cumsum over
        that window. Exact, because the softmax over the window equals the
        softmax over the full vocab once everything outside the top-k is -inf.
-    2. otherwise (``k`` is None, or top-k is effectively disabled -- vLLM
-       encodes that as ``k == vocab_size``): there is no bounded window, so use
+    2. otherwise (``k`` is None, no host bound, or top-k is effectively
+       disabled -- vLLM encodes that as ``k == vocab_size``): use
        ``kunlun_ops.top_p_renorm_probs``, which computes the top-p cutoff
        without sorting.
 
@@ -151,9 +154,10 @@ def apply_top_k_top_p_optimized(
         return apply_top_k_only(logits, k)
 
     if k is not None:
-        select_k = min(int(k.max().item()), logits.shape[1])
-        if select_k <= max_select_k:
-            return _top_k_top_p_partial_sort(logits, k, p, select_k)
+        if max_top_k is not None:
+            select_k = min(max_top_k, logits.shape[1])
+            if select_k <= max_select_k:
+                return _top_k_top_p_partial_sort(logits, k, p, select_k)
         logits = kunlun_ops.top_k_mask_logits(logits, k)
 
     renorm = kunlun_ops.top_p_renorm_probs(

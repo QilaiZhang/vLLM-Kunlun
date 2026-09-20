@@ -566,7 +566,9 @@ def compute_probs(
     # full int64 index tensor; with MTP T is ``batch * (num_spec + 1)``, so it
     # dominates the step at high concurrency. ``apply_top_k_top_p_optimized``
     # gives the identical result without a full-vocab sort.
-    logits = apply_top_k_top_p_optimized(logits, top_k, top_p)
+    logits = apply_top_k_top_p_optimized(
+        logits, top_k, top_p, max_top_k=getattr(sampling_metadata, "max_top_k", None)
+    )
     return logits.softmax(dim=-1, dtype=torch.float32)
 
 
