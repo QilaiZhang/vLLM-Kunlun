@@ -59,97 +59,126 @@ def _dflash_add_rms_norm(
             return norm(hidden_states), hidden_states
         return norm(hidden_states, residual)
 
-    residual_fp32 = hidden_states.float()
-    if residual is not None:
-        residual_fp32 = residual.float() + residual_fp32
-    variance = residual_fp32.square().mean(dim=-1, keepdim=True)
-    eps = float(norm.variance_epsilon)
-    normalized = residual_fp32 * torch.rsqrt(variance + eps)
-    normalized = normalized * norm.weight.float()
-    return normalized.to(norm.weight.dtype), residual_fp32
+    hidden_fp32 = hidden_states.float()
+    weight_fp32 = getattr(norm, "_dflash_weight_fp32", None)
+    if weight_fp32 is None:
+        # This fallback only applies when model weight finalization was skipped,
+        # for example in an isolated unit test.
+        weight_fp32 = norm.weight.float()
 
-
-def _prepare_rope_indices(rotary_emb: nn.Module) -> None:
-    """Register static RoPE permutation tables outside the compiled forward."""
-    if hasattr(rotary_emb, "_kunlun_rope_rotate_indices"):
-        return
-
-    rotary_dim = rotary_emb.rotary_dim
-    half_rotary_dim = rotary_dim // 2
-    head_size = rotary_emb.head_size
-    pass_dim = head_size - rotary_dim
-    device = rotary_emb.cos_sin_cache.device
-    if rotary_emb.is_neox_style:
-        rotate_values = list(range(half_rotary_dim, rotary_dim)) + list(
-            range(half_rotary_dim)
+    if residual is None:
+        residual_fp32 = hidden_fp32
+        normalized_fp32 = torch.empty_like(residual_fp32)
+        _dflash_rms_norm_fp32(
+            residual_fp32,
+            weight_fp32,
+            normalized_fp32,
+            float(norm.variance_epsilon),
         )
-        frequency_values = list(range(half_rotary_dim)) * 2
-        sign_values = [-1] * half_rotary_dim + [1] * half_rotary_dim
     else:
-        rotate_values = [dim ^ 1 for dim in range(rotary_dim)]
-        frequency_values = [dim // 2 for dim in range(rotary_dim)]
-        sign_values = [-1 if dim % 2 == 0 else 1 for dim in range(rotary_dim)]
+        residual_fp32 = residual.float()
+        _dflash_add_rms_norm_fp32(
+            hidden_fp32,
+            residual_fp32,
+            weight_fp32,
+            float(norm.variance_epsilon),
+        )
+        normalized_fp32 = hidden_fp32
 
-    rotate_values.extend(range(rotary_dim, head_size))
-    frequency_values.extend([0] * pass_dim)
-    sign_values.extend([1] * pass_dim)
-
-    rotate_indices = torch.tensor(rotate_values, dtype=torch.int64, device=device)
-    frequency_indices = torch.tensor(frequency_values, dtype=torch.int64, device=device)
-    signs = torch.tensor(sign_values, dtype=torch.int8, device=device)
-    rotary_emb.register_buffer(
-        "_kunlun_rope_rotate_indices", rotate_indices, persistent=False
-    )
-    rotary_emb.register_buffer(
-        "_kunlun_rope_cos_indices", frequency_indices, persistent=False
-    )
-    rotary_emb.register_buffer(
-        "_kunlun_rope_sin_indices",
-        frequency_indices + half_rotary_dim,
-        persistent=False,
-    )
-    rotary_emb.register_buffer("_kunlun_rope_signs", signs, persistent=False)
-    rotary_emb.register_buffer(
-        "_kunlun_rope_mask",
-        torch.tensor(
-            [True] * rotary_dim + [False] * pass_dim,
-            dtype=torch.bool,
-            device=device,
-        ),
-        persistent=False,
-    )
+    return normalized_fp32.to(norm.weight.dtype), residual_fp32
 
 
-def _apply_rope_without_cat(
-    rotary_emb: nn.Module,
+@custom_op(
+    "vllm::dflash2_rms_norm_fp32",
+    mutates_args={"output"},
+    device_types="cuda",
+)
+def _dflash_rms_norm_fp32(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+    epsilon: float,
+) -> None:
+    """Run the existing Kunlun RMSNorm kernel with FP32 buffers."""
+    kunlun_ops.rmsnorm(x, weight, output, epsilon)
+
+
+@_dflash_rms_norm_fp32.register_fake
+def _fake_dflash_rms_norm_fp32(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+    epsilon: float,
+) -> None:
+    return None
+
+
+@custom_op(
+    "vllm::dflash2_add_rms_norm_fp32",
+    mutates_args={"x", "residual"},
+    device_types="cuda",
+)
+def _dflash_add_rms_norm_fp32(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+) -> None:
+    """Fuse FP32 residual addition and RMSNorm using the Kunlun kernel."""
+    kunlun_ops.add_rmsnorm(
+        x,
+        residual,
+        weight,
+        x,
+        epsilon,
+        residual_output=residual,
+    )
+
+
+@_dflash_add_rms_norm_fp32.register_fake
+def _fake_dflash_add_rms_norm_fp32(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+) -> None:
+    return None
+
+
+@custom_op(
+    "vllm::dflash2_rotary_embedding",
+    mutates_args={"query", "key"},
+    device_types="cuda",
+)
+def _dflash2_rotary_embedding(
     positions: torch.Tensor,
     query: torch.Tensor,
-    key: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Apply RoPE without concatenation, stacking, or sliced-view writes."""
-    _prepare_rope_indices(rotary_emb)
-    positions = positions.flatten()
-    num_tokens = positions.shape[0]
-    cos_sin_cache = rotary_emb._match_cos_sin_cache_dtype(query)
-    cos_sin = cos_sin_cache.index_select(0, positions)
-    rotary_dim = rotary_emb.rotary_dim
-    head_size = rotary_emb.head_size
-    cos = cos_sin.index_select(-1, rotary_emb._kunlun_rope_cos_indices).unsqueeze(-2)
-    sin = cos_sin.index_select(-1, rotary_emb._kunlun_rope_sin_indices).unsqueeze(-2)
-    signed_sin = sin * rotary_emb._kunlun_rope_signs.view(1, 1, head_size)
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox_style: bool,
+) -> None:
+    """Expose Kunlun's in-place RoPE kernel to the compiled model graph."""
+    kunlun_ops.rotary_embedding(
+        positions,
+        query,
+        key,
+        head_size,
+        cos_sin_cache,
+        is_neox_style,
+    )
 
-    def rotate(tensor: torch.Tensor) -> torch.Tensor:
-        original_shape = tensor.shape
-        heads = tensor.reshape(num_tokens, -1, head_size)
-        rotated = heads.index_select(-1, rotary_emb._kunlun_rope_rotate_indices)
-        output = heads * cos + rotated * signed_sin
-        if rotary_dim < head_size:
-            output = torch.where(
-                rotary_emb._kunlun_rope_mask.view(1, 1, head_size), output, heads
-            )
-        return output.reshape(original_shape)
 
-    return rotate(query), None if key is None else rotate(key)
+@_dflash2_rotary_embedding.register_fake
+def _fake_dflash2_rotary_embedding(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox_style: bool,
+) -> None:
+    return None
 
 
 def _make_conv_shift_matrices(
@@ -301,17 +330,11 @@ class DFlashGroupedConv(nn.Module):
         # The finish-side result is consumed directly by residual-add/RMSNorm.
         # Keep it in FP32 so values outside the FP16 range can be normalized
         # before converting the hidden stream back to the model dtype.
-        return self._convolve(
-            hidden_states, coefficients, 1, keep_fp32_output=True
-        )
+        return self._convolve(hidden_states, coefficients, 1, keep_fp32_output=True)
 
 
 class DFlash2Qwen3Attention(DFlashQwen3Attention):
-    """DFlash attention whose regular forward avoids xflashinfer RoPE."""
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        _prepare_rope_indices(self.rotary_emb)
+    """DFlash attention backed by Kunlun's fused RoPE kernel."""
 
     def forward(
         self,
@@ -329,9 +352,17 @@ class DFlash2Qwen3Attention(DFlashQwen3Attention):
             k.view(*k_shape[:-1], k_shape[-1] // self.head_dim, self.head_dim)
         ).view(k_shape)
 
-        # xflashinfer rejects the DFlash layout, while vLLM's native fallback
-        # reconstructs Q/K with torch.cat, which Kunlun XMLIR also rejects.
-        q, k = _apply_rope_without_cat(self.rotary_emb, positions, q, k)
+        # DFlash flattens its token blocks before attention. Flatten positions
+        # to match that layout, then rotate Q/K in place with one Kunlun kernel.
+        cos_sin_cache = self.rotary_emb._match_cos_sin_cache_dtype(q)
+        _dflash2_rotary_embedding(
+            positions.flatten(),
+            q,
+            k,
+            self.rotary_emb.head_size,
+            cos_sin_cache,
+            self.rotary_emb.is_neox_style,
+        )
 
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
@@ -563,6 +594,27 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
                 prefix=maybe_prefix(prefix, "candidate_selector"),
             )
 
+    def _build_fused_kv_buffers(self) -> None:
+        """Build upstream KV buffers and cache FP32 weights for FP16 norms."""
+        super()._build_fused_kv_buffers()
+        if self.norm.weight.dtype != torch.float16:
+            return
+
+        norms = [self.norm]
+        for layer in self.layers:
+            norms.extend((layer.input_layernorm, layer.post_attention_layernorm))
+
+        for norm in norms:
+            weight_fp32 = norm.weight.detach().float()
+            if hasattr(norm, "_dflash_weight_fp32"):
+                norm._dflash_weight_fp32 = weight_fp32
+            else:
+                norm.register_buffer(
+                    "_dflash_weight_fp32",
+                    weight_fp32,
+                    persistent=False,
+                )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -581,9 +633,7 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
                 hidden_states=hidden_states,
                 residual=residual,
             )
-        hidden_states, _ = _dflash_add_rms_norm(
-            self.norm, hidden_states, residual
-        )
+        hidden_states, _ = _dflash_add_rms_norm(self.norm, hidden_states, residual)
         return hidden_states
 
     def precompute_and_store_context_kv(
@@ -592,13 +642,7 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
         context_positions: torch.Tensor,
         context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
     ) -> None:
-        """Precompute context K/V without vLLM's CUDA-only custom-op ABI.
-
-        vLLM 0.25.1 calls ``ops.rms_norm`` and ``ops.rotary_embedding``
-        directly here. Their four/six-argument CUDA schemas do not match the
-        legacy Kunlun ``_C`` registrations. RMSNorm therefore goes through
-        Kunlun's OOT layer modules, while RoPE uses equivalent no-cat math.
-        """
+        """Precompute context K/V with the native Kunlun kernels."""
         if not hasattr(self, "_num_attn_layers"):
             self._build_fused_kv_buffers()
 
@@ -610,7 +654,13 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
 
         # Keep the upstream fused projection: one GEMM produces K/V for all
         # decoder layers after the shared hidden-state normalization.
-        normed_context_states = self.hidden_norm(context_states)
+        normed_context_states = torch.empty_like(context_states)
+        kunlun_ops.rmsnorm(
+            context_states,
+            self._hidden_norm_weight,
+            normed_context_states,
+            self._rms_norm_eps,
+        )
         all_kv_flat = F.linear(
             normed_context_states, self._fused_kv_weight, self._fused_kv_bias
         )
@@ -622,19 +672,31 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
         all_k = all_kv[0]
         all_v = all_kv[1]
 
-        # The Kunlun RMSNorm kernel takes one weight vector. Normalize each
-        # layer separately instead of passing upstream's [L, H] grouped weight.
+        # The Kunlun kernel accepts one weight vector per invocation. Write
+        # directly into the destination slice to avoid a temporary result and
+        # the following slice-copy kernel.
         all_k_normed = torch.empty_like(all_k)
-        for layer_idx, layer in enumerate(self.layers):
-            all_k_normed[layer_idx] = layer.self_attn.k_norm(all_k[layer_idx])
+        for layer_idx in range(num_layers):
+            kunlun_ops.rmsnorm(
+                all_k[layer_idx],
+                self._k_norm_weights[layer_idx],
+                all_k_normed[layer_idx],
+                self._rms_norm_eps,
+            )
 
-        # Use the same no-cat fallback as the regular attention path. It
-        # supports the query-only form required by context K and preserves the
-        # configured RoPE cache/scaling.
+        # Run one in-place RoPE kernel across all layers. The Kunlun operator
+        # supports the query-only form used by context K.
         all_k_flat = all_k_normed.view(num_layers * num_ctx, kv_size)
         positions_repeated = context_positions.repeat(num_layers)
-        all_k_flat, _ = _apply_rope_without_cat(
-            self.layers[0].self_attn.rotary_emb, positions_repeated, all_k_flat, None
+        rotary_emb = self.layers[0].self_attn.rotary_emb
+        cos_sin_cache = rotary_emb._match_cos_sin_cache_dtype(all_k_flat)
+        kunlun_ops.rotary_embedding(
+            positions_repeated,
+            all_k_flat,
+            None,
+            rotary_emb.head_size,
+            cos_sin_cache,
+            rotary_emb.is_neox_style,
         )
 
         if context_slot_mapping is None:

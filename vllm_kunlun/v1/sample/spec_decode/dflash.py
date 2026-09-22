@@ -296,7 +296,7 @@ class DFlashProposer(UpstreamDFlashProposer):
         token_indices_to_sample = self._dflash_sample_indices_buffer[
             :batch_size * self.num_speculative_tokens
         ]
-        kunlun_ops.copy_and_expand_dflash_inputs_out(
+        kunlun_ops.copy_and_expand_dflash_inputs(
             next_token_ids=next_token_ids,
             target_positions=target_positions,
             query_start_loc=cad.query_start_loc,
