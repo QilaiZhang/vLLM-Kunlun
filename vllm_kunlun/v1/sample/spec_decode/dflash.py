@@ -146,6 +146,11 @@ class DFlashProposer(UpstreamDFlashProposer):
     ) -> None:
         self.is_dflash2 = is_dflash2_draft(vllm_config.speculative_config)
         super().__init__(vllm_config, device, runner=runner)
+        self._dflash_sample_indices_buffer = torch.empty(
+            self.input_ids.numel(),
+            dtype=torch.int32,
+            device=device,
+        )
         if self.is_dflash2:
             assert vllm_config.speculative_config is not None
             if vllm_config.speculative_config.draft_sample_method == "probabilistic":
@@ -288,14 +293,10 @@ class DFlashProposer(UpstreamDFlashProposer):
 
         self._dflash_num_context = num_context
         self._dflash_hidden_states = target_hidden_states
-        (
-            input_ids,
-            context_positions,
-            query_positions,
-            context_slot_mapping,
-            query_slot_mapping,
-            token_indices_to_sample,
-        ) = copy_and_expand_dflash_inputs_native(
+        token_indices_to_sample = self._dflash_sample_indices_buffer[
+            :batch_size * self.num_speculative_tokens
+        ]
+        kunlun_ops.copy_and_expand_dflash_inputs_out(
             next_token_ids=next_token_ids,
             target_positions=target_positions,
             query_start_loc=cad.query_start_loc,
@@ -304,12 +305,13 @@ class DFlashProposer(UpstreamDFlashProposer):
             num_speculative_tokens=self.num_speculative_tokens,
             parallel_drafting_token_id=self.parallel_drafting_token_id,
             num_rejected_tokens=num_rejected_tokens_gpu,
+            input_ids_out=self.input_ids[:num_query_total],
+            context_positions_out=self._context_positions_buffer[:num_context],
+            query_positions_out=self.positions[:num_query_total],
+            context_slots_out=self._context_slot_mapping_buffer[:num_context],
+            query_slots_out=self._slot_mapping_buffer[:num_query_total],
+            sample_indices_out=token_indices_to_sample,
         )
-        self.input_ids[:num_query_total].copy_(input_ids)
-        self.positions[:num_query_total].copy_(query_positions)
-        self._context_positions_buffer[:num_context].copy_(context_positions)
-        self._slot_mapping_buffer[:num_query_total].copy_(query_slot_mapping)
-        self._context_slot_mapping_buffer[:num_context].copy_(context_slot_mapping)
 
         new_query_start_loc = self.arange[: batch_size + 1] * num_query_per_req
         effective_seq_lens = cad.seq_lens
