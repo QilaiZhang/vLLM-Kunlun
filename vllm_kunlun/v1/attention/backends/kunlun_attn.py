@@ -231,6 +231,9 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
     # Max number of key/value length in the batch, especially for prefix cache
     max_kv_len: int | None = None
 
+    # DFlash uses an optimistic host LoD and an exact device LoD.
+    dflash_static_lod: bool = False
+
     # Max number of query tokens among request in the batch.
     max_decode_query_len: int | None = None
 
@@ -396,6 +399,7 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
             kv_lod_xpu=kv_lod_xpu,
             max_query_len=self.max_query_len,
             max_kv_len=self.max_kv_len,
+            dflash_static_lod=self.dflash_static_lod,
             max_prefill_seq_len=self.max_prefill_seq_len,
             max_decode_seq_len=0,
             query_start_loc=query_start_loc,
@@ -693,6 +697,22 @@ class KunlunAttentionMetadataBuilder:
         torch.cumsum(seq_lens_cpu[:num_reqs].to(torch.int32), dim=0, out=out[1:])
         return out
 
+    def _staged_kv_lod_xpu(self, seq_lens: torch.Tensor, num_reqs: int) -> torch.Tensor:
+        """Build the exact device LoD without reading lengths back to the host."""
+        ck = ("kv_lod_xpu", torch.int32, str(self.device))
+        buf = self._buf_cache.get(ck)
+        if buf is None or buf.numel() < num_reqs + 1:
+            buf = torch.empty(
+                max(num_reqs + 1, self._max_reqs + 1),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._buf_cache[ck] = buf
+        out = buf[: num_reqs + 1]
+        out[0].zero_()
+        torch.cumsum(seq_lens[:num_reqs], dim=0, dtype=torch.int32, out=out[1:])
+        return out
+
     def build(
         self, common_prefix_len: int, common_attn_metadata: CommonAttentionMetadata
     ):
@@ -728,13 +748,20 @@ class KunlunAttentionMetadataBuilder:
         )
 
         seq_lens = common_attn_metadata.seq_lens
+        dflash_static_lod = getattr(
+            common_attn_metadata, "_kunlun_dflash_static_lod", False
+        )
         # ``CommonAttentionMetadata.seq_lens_cpu`` is deprecated because its
         # lazy property hides a device-to-host synchronization. Reuse an
         # existing host mirror when the runner supplied one; otherwise make
         # the unavoidable transfer explicit before copying into our stable
         # persistent buffer.
         seq_lens_cpu_src = getattr(common_attn_metadata, "_seq_lens_cpu", None)
-        if seq_lens_cpu_src is None:
+        if dflash_static_lod:
+            seq_lens_cpu_src = common_attn_metadata.seq_lens_cpu_upper_bound
+            if seq_lens_cpu_src is None:
+                raise ValueError("DFlash requires CPU sequence-length upper bounds")
+        elif seq_lens_cpu_src is None:
             seq_lens_cpu_src = seq_lens.to("cpu")
         seq_lens_cpu = self._staged(
             "seq_lens_cpu",
@@ -761,9 +788,12 @@ class KunlunAttentionMetadataBuilder:
 
         if num_prefill_tokens > 0:
             kv_lod_cpu = self._staged_kv_lod(seq_lens_cpu, num_reqs)
-            kv_lod_xpu = self._staged(
-                "kv_lod_xpu", kv_lod_cpu, num_reqs + 1, self.device
-            )
+            if dflash_static_lod:
+                kv_lod_xpu = self._staged_kv_lod_xpu(seq_lens, num_reqs)
+            else:
+                kv_lod_xpu = self._staged(
+                    "kv_lod_xpu", kv_lod_cpu, num_reqs + 1, self.device
+                )
         else:
             kv_lod_cpu = None
             kv_lod_xpu = None
@@ -798,7 +828,9 @@ class KunlunAttentionMetadataBuilder:
             seq_lens_tensor_cpu=seq_lens_cpu,
             kv_lod_xpu=kv_lod_xpu,
             kv_lod_cpu=kv_lod_cpu,
-            max_query_len=max_prefill_seq_len,
+            max_query_len=int(max_prefill_seq_len),
+            max_kv_len=int(seq_lens_cpu.max().item()) if dflash_static_lod else None,
+            dflash_static_lod=dflash_static_lod,
             max_prefill_seq_len=max_prefill_seq_len,
             max_decode_seq_len=max_decode_seq_len,
             query_start_loc=query_start_loc,
@@ -1008,6 +1040,7 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
             # Prefix cache or KV sharing layers (must read K/V from cache)
             if (
                 self.kv_sharing_target_layer_name is not None
+                or prefill_meta.dflash_static_lod
                 or prefill_meta.query_start_loc_host[-1] != prefill_meta.kv_lod_cpu[-1]
             ):
                 # The input batch keeps a full-max-model-length block table.
@@ -1045,6 +1078,14 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     swa_left=swa_left,
                     swa_right=swa_right,
                     sink=self._get_sinks_fp32(),
+                    **(
+                        dict(
+                            max_query_len=prefill_meta.max_query_len,
+                            max_context_len=prefill_meta.max_kv_len,
+                        )
+                        if prefill_meta.dflash_static_lod
+                        else {}
+                    ),
                 )
             else:
                 prefill_output = output[

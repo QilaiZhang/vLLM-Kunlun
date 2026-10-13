@@ -294,7 +294,7 @@ class DFlashProposer(UpstreamDFlashProposer):
         self._dflash_num_context = num_context
         self._dflash_hidden_states = target_hidden_states
         token_indices_to_sample = self._dflash_sample_indices_buffer[
-            :batch_size * self.num_speculative_tokens
+            : batch_size * self.num_speculative_tokens
         ]
         kunlun_ops.copy_and_expand_dflash_inputs(
             next_token_ids=next_token_ids,
@@ -317,10 +317,22 @@ class DFlashProposer(UpstreamDFlashProposer):
         effective_seq_lens = cad.seq_lens
         if num_rejected_tokens_gpu is not None:
             effective_seq_lens = effective_seq_lens - num_rejected_tokens_gpu
+        seq_lens_cpu_upper_bound = cad.seq_lens_cpu_upper_bound
+        if seq_lens_cpu_upper_bound is None:
+            # Older vLLM runners do not populate the per-request upper bound.
+            # An existing host mirror is safe; otherwise max_seq_len is the
+            # batch-wide CPU bound computed by the runner. Neither path reads
+            # the device seq_lens back to the host.
+            seq_lens_cpu_upper_bound = getattr(cad, "_seq_lens_cpu", None)
+        if seq_lens_cpu_upper_bound is None:
+            seq_lens_cpu_upper_bound = torch.full(
+                (batch_size,),
+                int(cad.max_seq_len),
+                dtype=torch.int32,
+                device="cpu",
+            )
         new_seq_lens_cpu_upper_bound = (
-            cad.seq_lens_cpu_upper_bound + num_query_per_req
-            if cad.seq_lens_cpu_upper_bound is not None
-            else None
+            seq_lens_cpu_upper_bound[:batch_size] + num_query_per_req
         )
         new_cad = CommonAttentionMetadata(
             query_start_loc=new_query_start_loc,
@@ -340,6 +352,9 @@ class DFlashProposer(UpstreamDFlashProposer):
             slot_mapping=self._slot_mapping_buffer[:num_query_total],
             causal=self.dflash_causal,
         )
+        # The exact lengths stay on the device during asynchronous drafting.
+        # The host mirror is an upper bound for attention planning only.
+        new_cad._kunlun_dflash_static_lod = self.is_dflash2 and not self.dflash_causal
         return num_query_total, token_indices_to_sample, new_cad
 
     @override
