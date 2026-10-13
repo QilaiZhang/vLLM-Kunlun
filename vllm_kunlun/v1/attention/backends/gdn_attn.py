@@ -415,6 +415,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
+        context_lens_tensor = m.compute_num_computed_tokens()
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
         cache_mode = self.vllm_config.cache_config.mamba_cache_mode
         block_table_tensor = mamba_get_block_table_tensor(
@@ -476,12 +477,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_state_indices_tensor = block_table_tensor[:, 0].contiguous()
             if cpu_block_table is not None:
                 num_state_rows = non_spec_state_indices_tensor.size(0)
-                non_spec_state_indices_tensor_cpu = (
-                    self.non_spec_state_indices_tensor_cpu[:num_state_rows]
-                )
-                non_spec_state_indices_tensor_cpu.copy_(
-                    cpu_block_table[:num_state_rows, 0]
-                )
+                non_spec_state_indices_tensor_cpu = cpu_block_table[
+                    :num_state_rows, 0
+                ].contiguous()
                 padded_rows = query_start_loc_cpu[1:] == query_start_loc_cpu[:-1]
                 non_spec_state_indices_tensor_cpu.masked_fill_(
                     padded_rows,
@@ -554,12 +552,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     :num_spec_decodes, : self.num_spec + 1
                 ]
                 if cpu_block_table is not None:
-                    spec_state_indices_tensor_cpu = self.spec_state_indices_tensor_cpu[
+                    spec_state_indices_tensor_cpu = cpu_block_table[
                         :num_spec_decodes, : self.num_spec + 1
-                    ]
-                    spec_state_indices_tensor_cpu.copy_(
-                        cpu_block_table[:num_spec_decodes, : self.num_spec + 1]
-                    )
+                    ].contiguous()
                 else:
                     spec_state_indices_tensor_cpu = spec_state_indices_tensor
                 non_spec_state_indices_tensor = None
@@ -584,25 +579,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     spec_sequence_masks_cpu, : self.num_spec + 1
                 ]
                 if cpu_block_table is not None:
-                    spec_state_indices_tensor_cpu = self.spec_state_indices_tensor_cpu[
-                        :num_spec_decodes, : self.num_spec + 1
-                    ]
-                    spec_state_indices_tensor_cpu.copy_(
-                        cpu_block_table[spec_sequence_masks_cpu, : self.num_spec + 1]
-                    )
+                    spec_state_indices_tensor_cpu = cpu_block_table[
+                        spec_sequence_masks_cpu, : self.num_spec + 1
+                    ].contiguous()
                 else:
                     spec_state_indices_tensor_cpu = spec_state_indices_tensor
                 non_spec_state_indices_tensor = block_table_tensor[
                     non_spec_sequence_masks_cpu, 0
                 ].contiguous()
                 if cpu_block_table is not None:
-                    num_non_spec_rows = non_spec_state_indices_tensor.size(0)
-                    non_spec_state_indices_tensor_cpu = (
-                        self.non_spec_state_indices_tensor_cpu[:num_non_spec_rows]
-                    )
-                    non_spec_state_indices_tensor_cpu.copy_(
-                        cpu_block_table[non_spec_sequence_masks_cpu, 0]
-                    )
+                    non_spec_state_indices_tensor_cpu = cpu_block_table[
+                        non_spec_sequence_masks_cpu, 0
+                    ].contiguous()
                     non_spec_state_indices_tensor_cpu.masked_fill_(
                         non_spec_query_lens_cpu == 0,
                         NULL_BLOCK_ID,
@@ -683,26 +671,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             )
 
         if num_prefills > 0:
-            context_lens_cpu = m._num_computed_tokens_cpu
-            if context_lens_cpu is None:
-                query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-                if m.seq_lens_cpu_upper_bound is not None:
-                    # This bound is exact for prefill rows. Decode rows only
-                    # need the boolean fact that prior state exists.
-                    context_lens_cpu = m.seq_lens_cpu_upper_bound - query_lens_cpu
-                else:
-                    # Compatibility fallback for callers predating v0.25.1.
-                    # The normal runner always supplies one of the CPU fields.
-                    context_lens_cpu = m.num_computed_tokens_cpu
+            has_initial_state = context_lens_tensor > 0
             if spec_sequence_masks_cpu is not None:
-                context_lens_cpu = context_lens_cpu[non_spec_sequence_masks_cpu]
+                has_initial_state = has_initial_state[non_spec_sequence_masks_cpu]
                 assert non_spec_query_start_loc_cpu is not None
-            num_initial_rows = context_lens_cpu.numel()
-            has_initial_state_cpu = self.has_initial_state_cpu[:num_initial_rows]
-            has_initial_state_cpu.copy_(context_lens_cpu)
-            has_initial_state_cpu.clamp_(min=0, max=1)
-            self._has_initial_state.copy_to_gpu(num_initial_rows)
-            has_initial_state = self.has_initial_state[:num_initial_rows]
+            has_initial_state_cpu = has_initial_state.cpu()
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
                 compute_causal_conv1d_metadata(
                     non_spec_query_start_loc_cpu,
@@ -793,17 +766,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_conv_state_indices_tensor = (
                 spec_state_indices_tensor[:, 0].to(torch.int32).contiguous()
             )
-            spec_conv_source_cpu = (
-                spec_state_indices_tensor_cpu[:, 0]
+            spec_conv_state_indices_tensor_cpu = (
+                spec_state_indices_tensor_cpu[:, 0].contiguous()
                 if spec_state_indices_tensor_cpu is not None
                 else _to_cpu(spec_conv_state_indices_tensor)
             )
-            assert spec_conv_source_cpu is not None
-            num_spec_state_rows = spec_conv_source_cpu.numel()
-            spec_conv_state_indices_tensor_cpu = (
-                self.spec_conv_state_indices_tensor_cpu[:num_spec_state_rows]
-            )
-            spec_conv_state_indices_tensor_cpu.copy_(spec_conv_source_cpu)
             assert num_accepted_tokens is not None
             num_accepted_tokens = num_accepted_tokens.to(dtype=torch.int32)
 
@@ -921,8 +888,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             assert m.non_spec_state_indices_tensor is not None
             num_rows = m.non_spec_state_indices_tensor.shape[0]
             non_spec_indices = blk_table[:num_rows, 0].contiguous()
-            non_spec_indices_cpu = self.non_spec_state_indices_tensor_cpu[:num_rows]
-            non_spec_indices_cpu.copy_(cpu_block_table[:num_rows, 0])
+            non_spec_indices_cpu = cpu_block_table[:num_rows, 0].contiguous()
             if m.non_spec_query_start_loc_cpu is not None:
                 padded_rows = (
                     m.non_spec_query_start_loc_cpu[1:]
@@ -942,11 +908,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_indices = blk_table[masks, : self.num_spec + 1]
                 spec_source_cpu = cpu_block_table[masks, : self.num_spec + 1]
                 non_spec_indices = blk_table[non_spec_masks, 0].contiguous()
-                num_non_spec_rows = non_spec_indices.shape[0]
-                non_spec_indices_cpu = self.non_spec_state_indices_tensor_cpu[
-                    :num_non_spec_rows
-                ]
-                non_spec_indices_cpu.copy_(cpu_block_table[non_spec_masks, 0])
+                non_spec_indices_cpu = cpu_block_table[non_spec_masks, 0].contiguous()
                 if m.non_spec_query_start_loc_cpu is not None:
                     padded_rows = (
                         m.non_spec_query_start_loc_cpu[1:]
@@ -954,16 +916,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     )
                     non_spec_indices_cpu.masked_fill_(padded_rows, NULL_BLOCK_ID)
 
-            num_spec_rows = spec_indices.shape[0]
-            spec_indices_cpu = self.spec_state_indices_tensor_cpu[
-                :num_spec_rows, : self.num_spec + 1
-            ]
-            spec_indices_cpu.copy_(spec_source_cpu)
+            spec_indices_cpu = spec_source_cpu.contiguous()
             spec_conv_indices = spec_indices[:, 0].to(torch.int32).contiguous()
-            spec_conv_indices_cpu = self.spec_conv_state_indices_tensor_cpu[
-                :num_spec_rows
-            ]
-            spec_conv_indices_cpu.copy_(spec_indices_cpu[:, 0])
+            spec_conv_indices_cpu = spec_indices_cpu[:, 0].contiguous()
 
         if m.spec_pad_gather_idx is None and self._stage_spec_decode(
             m.num_prefills,
