@@ -276,7 +276,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             # v0.25.1 keeps one persistent-buffer builder per microbatch.
             # GDN speculative decode rejects u-batching, and non-spec GDN must
             # not make different microbatches alias the same graph buffers.
-            id(self) if vllm_config.parallel_config.use_ubatching else None,
+            # The reuse opt-out must also restore per-builder graph buffers;
+            # otherwise it does not provide a true Stage-1 correctness
+            # baseline and can hide bugs in the Stage-2 address-sharing path.
+            (
+                id(self)
+                if vllm_config.parallel_config.use_ubatching or reuse_disabled
+                else None
+            ),
             type(self),
             kv_cache_spec,
             device,
