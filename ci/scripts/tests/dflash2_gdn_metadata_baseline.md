@@ -71,3 +71,25 @@ python ci/scripts/tests/profile_dflash2_gdn_metadata.py \
 | 四象限 token 一致性 | `matrix-summary.json` | 待采集 |
 
 正式对比阶段 1/2/3 时必须复用同一模型、prompt、batch、参数和 profiling 窗口。不要把初始化、模型加载、首次图捕获混入稳态数据。
+
+## 阶段 2：复用开启前的等价性验证
+
+阶段 2 保持 `supports_update_block_table=False`。增加
+`--verify-gdn-update` 后，每个 GDN group 仍执行完整 `build()`，脚本同时用首个
+group 的 metadata 和后续 group 的 block table 调用 `update_block_table()`，逐项比较
+device/CPU state indices，并检查公共 graph buffer 地址相同、group-specific state
+buffer 地址不同：
+
+```bash
+python ci/scripts/tests/profile_dflash2_gdn_metadata.py \
+  --target-model /path/to/target-model \
+  --draft-model /path/to/dflash2-model \
+  --num-speculative-tokens 3 \
+  --verify-gdn-update \
+  --output-dir /tmp/dflash2-gdn-stage2
+```
+
+验证模式会产生额外 clone 和 device 同步，只用于正确性检查，不能用其 latency 或
+throughput 评价性能。每个 case 的 JSON 中
+`metrics.gdn_update_equivalence.group_updates_checked` 必须大于 0；任一字段或地址不一致
+会立即抛出异常。

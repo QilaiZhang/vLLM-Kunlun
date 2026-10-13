@@ -19,6 +19,10 @@ for vLLM-Kunlun inference.  The Python counters require the default TP=1 and
 force the V1 engine core in-process.  Use ``--tensor-parallel-size`` only for
 an XProfiler-only deployment-shape run; worker-local Python counters may then
 be incomplete.
+
+Stage 2 can additionally validate every later GDN group's full-build state
+indices against ``update_block_table()`` with ``--verify-gdn-update``. This
+keeps runtime reuse disabled while checking value and graph-address safety.
 """
 
 from __future__ import annotations
@@ -37,7 +41,6 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
-
 
 PROMPTS = (
     "A short explanation of gravity:",
@@ -88,6 +91,150 @@ class Timings:
         }
 
 
+class GDNUpdateEquivalenceVerifier:
+    """Compare Stage-2 block-table updates with the full build they replace."""
+
+    _STATE_FIELDS = (
+        "spec_state_indices_tensor",
+        "spec_state_indices_tensor_cpu",
+        "spec_conv_state_indices_tensor",
+        "spec_conv_state_indices_tensor_cpu",
+        "non_spec_state_indices_tensor",
+        "non_spec_state_indices_tensor_cpu",
+    )
+    _PRIVATE_BUFFER_FIELDS = (
+        "spec_state_indices_tensor",
+        "spec_conv_state_indices_tensor",
+        "non_spec_state_indices_tensor",
+    )
+
+    def __init__(self) -> None:
+        self.sources: dict[tuple[Any, type], tuple[Any, Any, dict[str, Any]]] = {}
+        self.steps = 0
+        self.checks = 0
+
+    def begin_step(self) -> None:
+        self.sources.clear()
+        self.steps += 1
+
+    @staticmethod
+    def _assert_same_tensor(name: str, expected: Any, actual: Any) -> None:
+        import torch
+
+        if expected is None or actual is None:
+            if expected is not actual:
+                raise AssertionError(
+                    f"GDN update field {name} differs: expected={expected}, "
+                    f"actual={actual}"
+                )
+            return
+        if expected.shape != actual.shape or expected.dtype != actual.dtype:
+            raise AssertionError(
+                f"GDN update field {name} metadata differs: "
+                f"expected shape/dtype={expected.shape}/{expected.dtype}, "
+                f"actual={actual.shape}/{actual.dtype}"
+            )
+        if not torch.equal(expected, actual):
+            raise AssertionError(f"GDN update field {name} has different values")
+
+    def observe(self, builder: Any, metadata: Any, common_metadata: Any) -> None:
+        if builder.vllm_config.cache_config.mamba_cache_mode not in ("none", "all"):
+            return
+        key = (builder.kv_cache_spec, type(builder))
+        source = self.sources.get(key)
+        if source is None:
+            source_state = {
+                name: (
+                    value.clone()
+                    if (value := getattr(metadata, name)) is not None
+                    else None
+                )
+                for name in self._STATE_FIELDS
+            }
+            self.sources[key] = (builder, metadata, source_state)
+            return
+
+        source_builder, source_metadata, source_state = source
+        if builder is source_builder:
+            raise AssertionError(
+                "GDN groups unexpectedly share one metadata builder; per-group "
+                "state buffers cannot be kept independent"
+            )
+
+        for name in self._PRIVATE_BUFFER_FIELDS:
+            if (
+                getattr(builder, name).data_ptr()
+                == getattr(source_builder, name).data_ptr()
+            ):
+                raise AssertionError(f"GDN group-private buffer {name} is shared")
+
+        if metadata.spec_pad_gather_idx is None and builder._stage_spec_decode(
+            metadata.num_prefills,
+            metadata.num_decodes,
+            metadata.num_spec_decodes,
+            metadata.num_spec_decode_tokens,
+        ):
+            common_fields = (
+                "spec_sequence_masks",
+                "spec_sequence_masks_cpu",
+                "spec_token_masks",
+                "spec_token_indx",
+                "non_spec_token_indx",
+                "spec_query_start_loc",
+                "num_accepted_tokens",
+            )
+        elif builder._stage_decode(
+            metadata.num_prefills,
+            metadata.num_decodes,
+            metadata.num_spec_decodes,
+        ):
+            common_fields = ("non_spec_query_start_loc",)
+        else:
+            common_fields = ()
+        for name in common_fields:
+            source_tensor = getattr(source_metadata, name)
+            actual_tensor = getattr(metadata, name)
+            if source_tensor is None or actual_tensor is None:
+                raise AssertionError(
+                    f"GDN common graph buffer {name} is unexpectedly None"
+                )
+            if source_tensor.data_ptr() != actual_tensor.data_ptr():
+                raise AssertionError(f"GDN common graph buffer {name} is not shared")
+
+        # Clone before update: the destination builder's full-build metadata
+        # points at its state buffers, which update_block_table writes in place.
+        expected = {
+            name: (
+                value.clone()
+                if (value := getattr(metadata, name)) is not None
+                else None
+            )
+            for name in self._STATE_FIELDS
+        }
+        updated = builder.update_block_table(
+            source_metadata,
+            common_metadata.block_table_tensor,
+            common_metadata.slot_mapping,
+        )
+        if updated is source_metadata:
+            raise AssertionError("GDN update mutated and returned the source metadata")
+        for name, expected_value in expected.items():
+            self._assert_same_tensor(name, expected_value, getattr(updated, name))
+        for name, source_value in source_state.items():
+            self._assert_same_tensor(
+                f"source.{name}", source_value, getattr(source_metadata, name)
+            )
+        self.checks += 1
+
+    def reset(self) -> None:
+        self.sources.clear()
+        self.steps = 0
+        self.checks = 0
+
+    def summary(self) -> dict[str, int]:
+        return {"steps": self.steps, "group_updates_checked": self.checks}
+
+
 def _timed_method(method: Callable[..., Any], timings: Timings) -> Callable[..., Any]:
     @functools.wraps(method)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
@@ -100,29 +247,55 @@ def _timed_method(method: Callable[..., Any], timings: Timings) -> Callable[...,
     return wrapped
 
 
-def _install_timing_hooks() -> tuple[Timings, Timings]:
+def _install_timing_hooks(
+    verify_gdn_update: bool,
+) -> tuple[Timings, Timings, GDNUpdateEquivalenceVerifier | None]:
     # Import only in the worker, after its environment has been fixed and
     # before constructing LLM/GPUModelRunner instances. Import Kunlun's GDN
     # implementation first: it replaces the upstream module symbol, which the
     # model-runner module then binds when imported.
-    from vllm_kunlun.v1.attention.backends.gdn_attn import (
-        GDNAttentionMetadataBuilder,
-    )
+    # isort: off
+    from vllm_kunlun.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    # isort: on
 
     attention_metadata = Timings()
     gdn_build = Timings()
+    verifier = GDNUpdateEquivalenceVerifier() if verify_gdn_update else None
+    runner_method = _timed_method(
+        GPUModelRunner._build_attention_metadata, attention_metadata
+    )
+    build_method = _timed_method(GDNAttentionMetadataBuilder.build, gdn_build)
+
+    @functools.wraps(runner_method)
+    def wrapped_runner(*args: Any, **kwargs: Any) -> Any:
+        if verifier is not None:
+            verifier.begin_step()
+        return runner_method(*args, **kwargs)
+
+    @functools.wraps(build_method)
+    def wrapped_build(*args: Any, **kwargs: Any) -> Any:
+        metadata = build_method(*args, **kwargs)
+        if verifier is not None:
+            builder = args[0]
+            common_metadata = kwargs.get("common_attn_metadata")
+            if common_metadata is None:
+                common_metadata = args[2]
+            verifier.observe(builder, metadata, common_metadata)
+        return metadata
+
     setattr(
         GPUModelRunner,
         "_build_attention_metadata",
-        _timed_method(GPUModelRunner._build_attention_metadata, attention_metadata),
+        wrapped_runner,
     )
     setattr(
         GDNAttentionMetadataBuilder,
         "build",
-        _timed_method(GDNAttentionMetadataBuilder.build, gdn_build),
+        wrapped_build,
     )
-    return attention_metadata, gdn_build
+    return attention_metadata, gdn_build, verifier
 
 
 def _maybe_start_xprofiler(enabled: bool) -> Any | None:
@@ -162,7 +335,9 @@ def _run_worker(args: argparse.Namespace) -> None:
     )
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "INFO")
 
-    attention_metadata, gdn_build = _install_timing_hooks()
+    attention_metadata, gdn_build, update_verifier = _install_timing_hooks(
+        args.verify_gdn_update
+    )
 
     import torch
     from vllm import LLM, SamplingParams
@@ -201,6 +376,8 @@ def _run_worker(args: argparse.Namespace) -> None:
     # counters.  XProfiler is also narrowed to this measured region.
     attention_metadata.reset()
     gdn_build.reset()
+    if update_verifier is not None:
+        update_verifier.reset()
     profiler = _maybe_start_xprofiler(args.xprofiler)
     iteration_ms: list[float] = []
     token_ids_by_iteration: list[list[list[int]]] = []
@@ -215,6 +392,11 @@ def _run_worker(args: argparse.Namespace) -> None:
             total_output_tokens += sum(len(ids) for ids in token_ids)
     finally:
         _stop_xprofiler(profiler)
+
+    if update_verifier is not None and update_verifier.checks == 0:
+        raise AssertionError(
+            "--verify-gdn-update did not observe a later equivalent GDN group"
+        )
 
     elapsed_s = sum(iteration_ms) / 1000
     metadata_summary = attention_metadata.summary()
@@ -245,6 +427,9 @@ def _run_worker(args: argparse.Namespace) -> None:
         "metrics": {
             "build_attention_metadata": metadata_summary,
             "gdn_full_build": gdn_summary,
+            "gdn_update_equivalence": (
+                update_verifier.summary() if update_verifier is not None else None
+            ),
             "gdn_full_builds_per_metadata_call": (
                 gdn_summary["calls"] / metadata_summary["calls"]
                 if metadata_summary["calls"]
@@ -288,9 +473,7 @@ def _case_name(async_scheduling: str, full_graph: str) -> str:
 
 def _run_matrix(args: argparse.Namespace) -> None:
     async_modes = (
-        ("off", "on")
-        if args.async_scheduling == "both"
-        else (args.async_scheduling,)
+        ("off", "on") if args.async_scheduling == "both" else (args.async_scheduling,)
     )
     graph_modes = ("off", "on") if args.full_graph == "both" else (args.full_graph,)
     output_dir = Path(args.output_dir)
@@ -333,6 +516,8 @@ def _run_matrix(args: argparse.Namespace) -> None:
             command.extend(("--dtype", args.dtype))
             if args.xprofiler:
                 command.append("--xprofiler")
+            if args.verify_gdn_update:
+                command.append("--verify-gdn-update")
 
             print(f"\n=== {case_name} ===", flush=True)
             subprocess.run(command, check=True)
@@ -350,8 +535,7 @@ def _run_matrix(args: argparse.Namespace) -> None:
         "deterministic_tokens_match_reference": token_match,
         "all_tokens_match": all(token_match.values()),
         "cases": {
-            path.stem: result["metrics"]
-            for path, result in zip(result_paths, results)
+            path.stem: result["metrics"] for path, result in zip(result_paths, results)
         },
     }
     summary_path = output_dir / "matrix-summary.json"
@@ -390,6 +574,14 @@ def _parse_args() -> argparse.Namespace:
         "--xprofiler",
         action="store_true",
         help="Call xtorch_ops profiler start/end around measured iterations",
+    )
+    parser.add_argument(
+        "--verify-gdn-update",
+        action="store_true",
+        help=(
+            "Compare Stage-2 update_block_table results with each later "
+            "group's full build; reuse remains disabled"
+        ),
     )
     args = parser.parse_args()
     if args.worker:
