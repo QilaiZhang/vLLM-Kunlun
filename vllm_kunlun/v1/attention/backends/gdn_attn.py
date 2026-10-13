@@ -1159,7 +1159,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             f"cudagraph capture sizes ({self.decode_cudagraph_max_bs})."
         )
         num_accepted_tokens = torch.diff(m.query_start_loc)
-        num_decode_draft_tokens_cpu = torch.diff(m.query_start_loc_cpu).sub_(1)
+        # During v0.25.1 FULL-graph capture the device query boundaries are
+        # authoritative. The CPU mirror can still describe padded rows from
+        # the dummy input; using it may capture only the first real request and
+        # leave later batch rows permanently zero on replay. This synchronization
+        # happens only during startup capture, not on the steady-state metadata
+        # path that Stage 1 optimizes.
+        num_decode_draft_tokens_cpu = (num_accepted_tokens - 1).cpu()
         assert num_decode_draft_tokens_cpu.shape == num_accepted_tokens.shape
 
         return self.build(0, m, num_accepted_tokens, num_decode_draft_tokens_cpu)
