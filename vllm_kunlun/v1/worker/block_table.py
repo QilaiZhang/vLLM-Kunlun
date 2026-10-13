@@ -10,12 +10,17 @@ relied on ``torch.searchsorted``, which has no Kunlun XPU implementation and
 silently falls back to CPU (host sync + D2H/H2D round trip every step). The
 native op computes the whole mapping on-device in a single launch.
 
+The existing CPU block-table mirror is also registered by device pointer for
+GDN metadata construction. This lets the GDN builder obtain host state indices
+without reading the device block table back once per attention group.
+
 Triggering: imported from ``vllm_kunlun.__init__`` post-import hook
 once ``vllm.v1.worker.block_table`` is loaded. Idempotent under fork()
 and re-import via the ``_kunlun_slot_patched`` flag on the class.
 """
 
 import logging
+from weakref import WeakValueDictionary
 
 import kunlun_ops
 import torch
@@ -23,6 +28,29 @@ from vllm.v1.worker.block_table import PAD_SLOT_ID
 from vllm.v1.worker.block_table import BlockTable as _upstream_cls
 
 logger = logging.getLogger("vllm_kunlun")
+
+
+def _get_device_tensor_with_cpu_mirror(self, num_reqs):
+    original = _upstream_cls._kunlun_original_get_device_tensor
+    tensor = original(self, num_reqs)
+    self._kunlun_cpu_mirror_tables[tensor.data_ptr()] = self
+    return tensor
+
+
+def get_cpu_block_table(device_tensor: torch.Tensor) -> torch.Tensor | None:
+    """Return the persistent host mirror backing ``device_tensor``.
+
+    ``GPUModelRunner._get_block_table`` obtains the device view through
+    ``BlockTable.get_device_tensor``. Registering that view's base pointer lets
+    attention builders recover the already-maintained ``CpuGpuBuffer.cpu``
+    tensor without changing vLLM's ``CommonAttentionMetadata`` API.
+    """
+    registry = getattr(_upstream_cls, "_kunlun_cpu_mirror_tables", None)
+    table = registry.get(device_tensor.data_ptr()) if registry is not None else None
+    if table is None:
+        return None
+    rows, columns = device_tensor.shape
+    return table.get_cpu_tensor()[:rows, :columns]
 
 
 def _compute_slot_mapping(self, num_reqs, query_start_loc, positions):
@@ -112,6 +140,9 @@ def _compute_slot_mapping(self, num_reqs, query_start_loc, positions):
 
 # Idempotent monkey-patch: safe under fork() and re-import.
 if not getattr(_upstream_cls, "_kunlun_slot_patched", False):
+    _upstream_cls._kunlun_cpu_mirror_tables = WeakValueDictionary()
+    _upstream_cls._kunlun_original_get_device_tensor = _upstream_cls.get_device_tensor
+    _upstream_cls.get_device_tensor = _get_device_tensor_with_cpu_mirror
     _upstream_cls.compute_slot_mapping = _compute_slot_mapping
     _upstream_cls._kunlun_slot_patched = True
     logger.info(
