@@ -1,0 +1,73 @@
+# DFlash2 GDN metadata 阶段 0 基线
+
+本基线固定请求和采样参数，以独立进程覆盖以下四种配置，避免模型实例、图捕获及缓存状态相互污染：
+
+| case | async scheduling | DFlash2 drafter FULL graph |
+| --- | --- | --- |
+| `async-off_full-graph-off` | 关闭 | 关闭 |
+| `async-off_full-graph-on` | 关闭 | 开启 |
+| `async-on_full-graph-off` | 开启 | 关闭 |
+| `async-on_full-graph-on` | 开启 | 开启 |
+
+默认固定参数为：batch 2、speculative tokens 8、生成 32 tokens、warmup 2 轮、测量 5 轮、seed 2026、FP16、max model length 256。采样使用 temperature 0，脚本会自动比较四种配置的每轮 token IDs。
+
+## 运行
+
+在安装当前 vLLM-Kunlun 与 `kunlun_ops` 的设备环境中，从仓库根目录运行：
+
+```bash
+python ci/scripts/tests/profile_dflash2_gdn_metadata.py \
+  --target-model /path/to/target-model \
+  --draft-model /path/to/dflash2-model \
+  --output-dir /tmp/dflash2-gdn-baseline
+```
+
+脚本默认强制 `VLLM_ENABLE_V1_MULTIPROCESSING=0`，使 TP=1 时 Python hook 与实际 `GPUModelRunner` 位于同一进程。这样可准确记录：
+
+- `GPUModelRunner._build_attention_metadata` 调用次数和主机 wall time；
+- `GDNAttentionMetadataBuilder.build()` 完整 build 次数和主机 wall time；
+- 每轮端到端 latency、输出 token throughput；
+- 四种配置下的确定性 token IDs。
+
+模型无法在单卡运行时可设置 `--tensor-parallel-size N`，但多进程 executor 中 Python hook 可能只覆盖部分 rank；这时 build 次数和 CPU 时间不能作为正式结论，应以 TP=1 小模型复现或在 worker 内增加相同 hook。XProfiler 的 device timeline 仍可用于部署形态分析。
+
+## XProfiler 采集
+
+先启动 daemon：
+
+```bash
+/path/to/xprofiler -r 500 --xpu=0 -e /tmp/dflash2-gdn-baseline/trace_output -d
+```
+
+再设置 daemon 生成的 socket，并运行单个 case。一次只采一个 case，trace 更容易对齐：
+
+```bash
+export XPU_ENABLE_PROFILER_TRACING=1
+export XPU_TRACING_OUTPUT_NAME=/path/to/xprofiler.sock
+python ci/scripts/tests/profile_dflash2_gdn_metadata.py \
+  --target-model /path/to/target-model \
+  --draft-model /path/to/dflash2-model \
+  --async-scheduling on \
+  --full-graph on \
+  --xprofiler \
+  --output-dir /tmp/dflash2-gdn-baseline/async-on-full-on
+```
+
+`--xprofiler` 只包围 warmup 之后的测量区间。若要分别采集四象限，使用不同的 `trace_output` 目录重复执行单个 case。
+
+## 结果与人工记录
+
+每个 case 生成一个 JSON，`matrix-summary.json` 汇总核心指标及 token 一致性。XProfiler 中的以下指标需要人工读取并补入实验记录：
+
+| 指标 | 读取方式 | baseline |
+| --- | --- | --- |
+| `_build_attention_metadata` CPU total / p95 | case JSON | 待采集 |
+| GDN full build 次数 / metadata call | case JSON | 待采集 |
+| D2H 次数与总时长 | XProfiler timeline | 待采集 |
+| H2D 次数与总时长 | XProfiler timeline | 待采集 |
+| metadata 后最大 device 空泡 | XProfiler timeline | 待采集 |
+| decode 稳态平均 step latency | XProfiler timeline | 待采集 |
+| output token throughput | case JSON | 待采集 |
+| 四象限 token 一致性 | `matrix-summary.json` | 待采集 |
+
+正式对比阶段 1/2/3 时必须复用同一模型、prompt、batch、参数和 profiling 窗口。不要把初始化、模型加载、首次图捕获混入稳态数据。
