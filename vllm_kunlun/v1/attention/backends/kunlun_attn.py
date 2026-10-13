@@ -323,20 +323,21 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
         )
 
         # Compute some attn_metadata fields which default to None
-        query_start_loc = (
-            None
-            if self.query_start_loc is None
-            else self.query_start_loc[-(self.num_prefills + 1) :]
-            - self.query_start_loc[-(self.num_prefills + 1)]
-        )
+        all_prefill = self.num_decodes == 0
+        if self.query_start_loc is None or all_prefill:
+            query_start_loc = self.query_start_loc
+        else:
+            start = -(self.num_prefills + 1)
+            query_start_loc = self.query_start_loc[start:] - self.query_start_loc[start]
         # The flash-attention metadata keeps LOD information on both host and
         # device.
-        query_start_loc_host = (
-            None
-            if self.query_start_loc_host is None
-            else self.query_start_loc_host[-(self.num_prefills + 1) :]
-            - self.query_start_loc_host[-(self.num_prefills + 1)]
-        )
+        if self.query_start_loc_host is None or all_prefill:
+            query_start_loc_host = self.query_start_loc_host
+        else:
+            start = -(self.num_prefills + 1)
+            query_start_loc_host = (
+                self.query_start_loc_host[start:] - self.query_start_loc_host[start]
+            )
 
         # Prefix-cache metadata is populated when prefix caching is enabled.
         kv_prefix_start_loc_host = None
@@ -376,6 +377,9 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
         if self.kv_lod_cpu is None:
             kv_lod_cpu = None
             kv_lod_xpu = None
+        elif all_prefill:
+            kv_lod_cpu = self.kv_lod_cpu
+            kv_lod_xpu = self.kv_lod_xpu
         else:
             start = -(self.num_prefills + 1)
             base_cpu = self.kv_lod_cpu[start]

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import kunlun_ops
@@ -12,11 +13,15 @@ import numpy as np
 import torch
 from torch import nn
 from typing_extensions import override
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.spec_decode.dflash import DFlashProposer as UpstreamDFlashProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+
+from vllm_kunlun.v1.sample.spec_decode.dflash_cudagraph import (
+    DFlashDrafterCUDAGraphWrapper,
+)
 
 
 def is_dflash2_draft(speculative_config: Any) -> bool:
@@ -151,6 +156,9 @@ class DFlashProposer(UpstreamDFlashProposer):
             dtype=torch.int32,
             device=device,
         )
+        self._dflash_seq_lens_buffer = torch.empty(
+            self.max_batch_size, dtype=torch.int32, device=device
+        )
         if self.is_dflash2:
             assert vllm_config.speculative_config is not None
             if vllm_config.speculative_config.draft_sample_method == "probabilistic":
@@ -163,6 +171,23 @@ class DFlashProposer(UpstreamDFlashProposer):
             # K needs a separately compiled model/kernel and is intentionally
             # outside this first V1 implementation.
             self.dflash2_num_speculative_tokens = self.num_speculative_tokens
+            query_len = 1 + self.dflash2_num_speculative_tokens
+            compilation_config = self.vllm_config.compilation_config
+            max_capture_size = compilation_config.max_cudagraph_capture_size
+            if (
+                compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+                and compilation_config.cudagraph_capture_sizes
+                and max_capture_size is not None
+                and max_capture_size >= query_len
+            ):
+                # MRV1 only aligns the shared graph sizes when the target's
+                # decode graph is FULL. The DFlash2 drafter also uses those
+                # sizes in PIECEWISE mode, and every convolution requires a
+                # whole number of fixed-width request blocks.
+                compilation_config.adjust_cudagraph_sizes_for_spec_decode(
+                    query_len,
+                    self.vllm_config.parallel_config.tensor_parallel_size,
+                )
 
     @property
     def dflash_config(self) -> dict[str, Any]:
@@ -174,6 +199,45 @@ class DFlashProposer(UpstreamDFlashProposer):
             bool(getattr(self.draft_model_config.hf_config, "is_causal", False)),
         )
         return config
+
+    @override
+    def _determine_batch_execution_and_padding(
+        self,
+        num_tokens: int,
+        use_cudagraphs: bool = True,
+    ) -> tuple[CUDAGraphMode, int, torch.Tensor | None]:
+        if self.is_dflash2:
+            # dummy_run may request fewer than K+1 query tokens, including
+            # when graph use is disabled. Real drafting already has N*(K+1).
+            query_len = 1 + self.dflash2_num_speculative_tokens
+            num_tokens = ((num_tokens + query_len - 1) // query_len) * query_len
+        mode, num_input_tokens, num_tokens_across_dp = (
+            super()._determine_batch_execution_and_padding(
+                num_tokens, use_cudagraphs=use_cudagraphs
+            )
+        )
+        if self.is_dflash2 and num_input_tokens % query_len:
+            raise ValueError(
+                "DFlash2 graph padding must preserve complete request blocks: "
+                f"num_input_tokens={num_input_tokens}, query_len={query_len}"
+            )
+        return mode, num_input_tokens, num_tokens_across_dp
+
+    @override
+    def load_model(self, target_model: nn.Module) -> None:
+        super().load_model(target_model)
+        if (
+            self.is_dflash2
+            and not self.dflash_causal
+            and os.getenv("VLLM_KUNLUN_DRAFTER_FULL_CUDAGRAPH", "0") == "1"
+        ):
+            self.model = DFlashDrafterCUDAGraphWrapper(
+                self.model,
+                self.vllm_config,
+                self.device,
+                query_len=1 + self.dflash2_num_speculative_tokens,
+                causal=self.dflash_causal,
+            )
 
     @override
     def prepare_next_token_ids_padded(
@@ -314,9 +378,11 @@ class DFlashProposer(UpstreamDFlashProposer):
         )
 
         new_query_start_loc = self.arange[: batch_size + 1] * num_query_per_req
-        effective_seq_lens = cad.seq_lens
+        effective_seq_lens = self._dflash_seq_lens_buffer[:batch_size]
+        effective_seq_lens.copy_(cad.seq_lens[:batch_size])
         if num_rejected_tokens_gpu is not None:
-            effective_seq_lens = effective_seq_lens - num_rejected_tokens_gpu
+            effective_seq_lens.sub_(num_rejected_tokens_gpu[:batch_size])
+        effective_seq_lens.add_(num_query_per_req)
         seq_lens_cpu_upper_bound = cad.seq_lens_cpu_upper_bound
         if seq_lens_cpu_upper_bound is None:
             # Older vLLM runners do not populate the per-request upper bound.
@@ -334,9 +400,23 @@ class DFlashProposer(UpstreamDFlashProposer):
         new_seq_lens_cpu_upper_bound = (
             seq_lens_cpu_upper_bound[:batch_size] + num_query_per_req
         )
+        if isinstance(self.model, DFlashDrafterCUDAGraphWrapper):
+            # One conservative host planning LoD per graph bucket. The device
+            # LoD below retains the real, possibly rejected-token length.
+            upper = int(new_seq_lens_cpu_upper_bound[:batch_size].max().item())
+            bucket = 1 << (upper - 1).bit_length()
+            capacity = cad.block_table_tensor.shape[1] * self.block_size
+            if capacity <= 0:
+                raise ValueError("DFlash requires a nonempty KV page table")
+            # Allocated pages also bound every valid device length, even when
+            # the scheduler's optimistic upper bound includes rejected tokens.
+            bucket = min(bucket, capacity)
+            new_seq_lens_cpu_upper_bound = torch.full_like(
+                new_seq_lens_cpu_upper_bound, bucket
+            )
         new_cad = CommonAttentionMetadata(
             query_start_loc=new_query_start_loc,
-            seq_lens=effective_seq_lens + num_query_per_req,
+            seq_lens=effective_seq_lens,
             query_start_loc_cpu=(
                 torch.from_numpy(self.token_arange_np[: batch_size + 1]).clone()
                 * num_query_per_req
@@ -347,7 +427,7 @@ class DFlashProposer(UpstreamDFlashProposer):
             num_reqs=cad.num_reqs,
             num_actual_tokens=num_query_total,
             max_query_len=num_query_per_req,
-            max_seq_len=cad.max_seq_len + num_query_per_req,
+            max_seq_len=int(new_seq_lens_cpu_upper_bound[:batch_size].max().item()),
             block_table_tensor=cad.block_table_tensor,
             slot_mapping=self._slot_mapping_buffer[:num_query_total],
             causal=self.dflash_causal,

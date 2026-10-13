@@ -19,6 +19,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -36,6 +37,35 @@ from vllm.model_executor.models.utils import maybe_prefix
 # with upstream DFlash2. Model construction is serialized by vLLM; the lock also
 # makes the temporary compatibility substitution safe between DFlash2 instances.
 _MODEL_CONSTRUCTION_LOCK = RLock()
+
+
+def _dflash_attention(
+    attention: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> torch.Tensor:
+    layer = attention.attn
+    buffers = getattr(layer, "_kunlun_dflash_graph_buffers", None)
+    if buffers is None:
+        return layer(query, key, value)
+
+    output, handoff = buffers
+    output.zero_()
+    metadata = get_forward_context().attn_metadata
+    if isinstance(metadata, dict):
+        metadata = metadata[layer.layer_name]
+    layer.impl.forward(
+        layer,
+        query.view(-1, layer.num_heads, layer.head_size),
+        key.view(-1, layer.num_kv_heads, layer.head_size),
+        value.view(-1, layer.num_kv_heads, layer.head_size_v),
+        layer.kv_cache,
+        metadata,
+        output=output,
+    )
+    handoff.copy_(output)
+    return handoff.view(-1, layer.num_heads * layer.head_size_v)
 
 
 def _dflash_add_rms_norm(
@@ -364,7 +394,7 @@ class DFlash2Qwen3Attention(DFlashQwen3Attention):
             self.rotary_emb.is_neox_style,
         )
 
-        attn_output = self.attn(q, k, v)
+        attn_output = _dflash_attention(self, q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
 
