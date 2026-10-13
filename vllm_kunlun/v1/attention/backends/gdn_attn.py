@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Backend for GatedDeltaNet attention."""
 
+import os
 from dataclasses import dataclass, replace
 from weakref import WeakValueDictionary
 
@@ -213,8 +214,7 @@ _COMMON_GRAPH_BUFFERS: WeakValueDictionary[tuple, _GDNCommonGraphBuffers] = (
 
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
-    # Stage 2 only provides and validates the update path. Stage 3 enables the
-    # generic runner cache after graph-address equivalence is verified.
+    # Instance initialization enables this only for the graph-safe subset.
     supports_update_block_table = False
 
     reorder_batch_threshold: int = 1
@@ -247,6 +247,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         self.use_full_cuda_graph: bool = (
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+        )
+        reuse_disabled = os.getenv(
+            "VLLM_KUNLUN_DISABLE_GDN_METADATA_REUSE", "0"
+        ).lower() in ("1", "true", "on")
+        self.supports_update_block_table = (
+            type(self) is GDNAttentionMetadataBuilder
+            and self.vllm_config.cache_config.mamba_cache_mode in ("none", "all")
+            and not self.vllm_config.parallel_config.use_ubatching
+            and not reuse_disabled
         )
 
         self.decode_cudagraph_max_bs: int = (

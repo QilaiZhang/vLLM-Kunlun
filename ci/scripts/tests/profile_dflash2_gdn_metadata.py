@@ -249,7 +249,7 @@ def _timed_method(method: Callable[..., Any], timings: Timings) -> Callable[...,
 
 def _install_timing_hooks(
     verify_gdn_update: bool,
-) -> tuple[Timings, Timings, GDNUpdateEquivalenceVerifier | None]:
+) -> tuple[Timings, Timings, Timings, GDNUpdateEquivalenceVerifier | None]:
     # Import only in the worker, after its environment has been fixed and
     # before constructing LLM/GPUModelRunner instances. Import Kunlun's GDN
     # implementation first: it replaces the upstream module symbol, which the
@@ -262,11 +262,15 @@ def _install_timing_hooks(
 
     attention_metadata = Timings()
     gdn_build = Timings()
+    gdn_update = Timings()
     verifier = GDNUpdateEquivalenceVerifier() if verify_gdn_update else None
     runner_method = _timed_method(
         GPUModelRunner._build_attention_metadata, attention_metadata
     )
     build_method = _timed_method(GDNAttentionMetadataBuilder.build, gdn_build)
+    update_method = _timed_method(
+        GDNAttentionMetadataBuilder.update_block_table, gdn_update
+    )
 
     @functools.wraps(runner_method)
     def wrapped_runner(*args: Any, **kwargs: Any) -> Any:
@@ -295,7 +299,12 @@ def _install_timing_hooks(
         "build",
         wrapped_build,
     )
-    return attention_metadata, gdn_build, verifier
+    setattr(
+        GDNAttentionMetadataBuilder,
+        "update_block_table",
+        update_method,
+    )
+    return attention_metadata, gdn_build, gdn_update, verifier
 
 
 def _maybe_start_xprofiler(enabled: bool) -> Any | None:
@@ -333,9 +342,21 @@ def _run_worker(args: argparse.Namespace) -> None:
     os.environ["VLLM_KUNLUN_DRAFTER_FULL_CUDAGRAPH"] = (
         "1" if args.full_graph == "on" else "0"
     )
+    # Equivalence mode needs every group to execute a full build so it can
+    # compare that reference with the update path. Normal Stage-3 runs leave
+    # reuse enabled unless the caller explicitly sets this emergency opt-out.
+    if args.verify_gdn_update:
+        os.environ["VLLM_KUNLUN_DISABLE_GDN_METADATA_REUSE"] = "1"
+    elif args.expect_gdn_reuse and os.getenv(
+        "VLLM_KUNLUN_DISABLE_GDN_METADATA_REUSE", "0"
+    ).lower() in ("1", "true", "on"):
+        raise RuntimeError(
+            "--expect-gdn-reuse conflicts with "
+            "VLLM_KUNLUN_DISABLE_GDN_METADATA_REUSE"
+        )
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "INFO")
 
-    attention_metadata, gdn_build, update_verifier = _install_timing_hooks(
+    attention_metadata, gdn_build, gdn_update, update_verifier = _install_timing_hooks(
         args.verify_gdn_update
     )
 
@@ -376,6 +397,7 @@ def _run_worker(args: argparse.Namespace) -> None:
     # counters.  XProfiler is also narrowed to this measured region.
     attention_metadata.reset()
     gdn_build.reset()
+    gdn_update.reset()
     if update_verifier is not None:
         update_verifier.reset()
     profiler = _maybe_start_xprofiler(args.xprofiler)
@@ -401,6 +423,19 @@ def _run_worker(args: argparse.Namespace) -> None:
     elapsed_s = sum(iteration_ms) / 1000
     metadata_summary = attention_metadata.summary()
     gdn_summary = gdn_build.summary()
+    gdn_update_summary = gdn_update.summary()
+    if args.expect_gdn_reuse:
+        if gdn_summary["calls"] != metadata_summary["calls"]:
+            raise AssertionError(
+                "GDN metadata reuse expected exactly one full build per "
+                "_build_attention_metadata call, got "
+                f"{gdn_summary['calls']} builds for "
+                f"{metadata_summary['calls']} metadata calls"
+            )
+        if gdn_update_summary["calls"] == 0:
+            raise AssertionError(
+                "GDN metadata reuse expected block-table updates, but none ran"
+            )
     result = {
         "schema_version": 1,
         "git_revision": _git_revision(),
@@ -422,16 +457,26 @@ def _run_worker(args: argparse.Namespace) -> None:
             "max_tokens": args.max_tokens,
             "warmup_iterations": args.warmup_iterations,
             "iterations": args.iterations,
+            "gdn_metadata_reuse_disabled": os.getenv(
+                "VLLM_KUNLUN_DISABLE_GDN_METADATA_REUSE", "0"
+            ).lower()
+            in ("1", "true", "on"),
         },
         "prompts": prompts,
         "metrics": {
             "build_attention_metadata": metadata_summary,
             "gdn_full_build": gdn_summary,
+            "gdn_block_table_update": gdn_update_summary,
             "gdn_update_equivalence": (
                 update_verifier.summary() if update_verifier is not None else None
             ),
             "gdn_full_builds_per_metadata_call": (
                 gdn_summary["calls"] / metadata_summary["calls"]
+                if metadata_summary["calls"]
+                else None
+            ),
+            "gdn_updates_per_metadata_call": (
+                gdn_update_summary["calls"] / metadata_summary["calls"]
                 if metadata_summary["calls"]
                 else None
             ),
@@ -518,6 +563,8 @@ def _run_matrix(args: argparse.Namespace) -> None:
                 command.append("--xprofiler")
             if args.verify_gdn_update:
                 command.append("--verify-gdn-update")
+            if args.expect_gdn_reuse:
+                command.append("--expect-gdn-reuse")
 
             print(f"\n=== {case_name} ===", flush=True)
             subprocess.run(command, check=True)
@@ -583,7 +630,17 @@ def _parse_args() -> argparse.Namespace:
             "group's full build; reuse remains disabled"
         ),
     )
+    parser.add_argument(
+        "--expect-gdn-reuse",
+        action="store_true",
+        help=(
+            "Require exactly one GDN full build per metadata call and at "
+            "least one block-table update"
+        ),
+    )
     args = parser.parse_args()
+    if args.verify_gdn_update and args.expect_gdn_reuse:
+        parser.error("--verify-gdn-update and --expect-gdn-reuse are exclusive")
     if args.worker:
         if args.async_scheduling == "both" or args.full_graph == "both":
             parser.error("worker mode requires one async and one graph mode")

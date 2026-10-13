@@ -93,3 +93,36 @@ python ci/scripts/tests/profile_dflash2_gdn_metadata.py \
 throughput 评价性能。每个 case 的 JSON 中
 `metrics.gdn_update_equivalence.group_updates_checked` 必须大于 0；任一字段或地址不一致
 会立即抛出异常。
+
+## 阶段 3：启用跨 KV group 复用
+
+阶段 3 默认只为精确类型 `GDNAttentionMetadataBuilder`、`mamba_cache_mode` 为
+`none/all` 且未启用 u-batching 的配置打开 vLLM 0.25.1 通用 metadata cache。可用
+`--expect-gdn-reuse` 验证稳态每次 `_build_attention_metadata` 恰好只有一次完整 GDN
+build，并且至少执行一次 block-table update：
+
+```bash
+python ci/scripts/tests/profile_dflash2_gdn_metadata.py \
+  --target-model /path/to/target-model \
+  --draft-model /path/to/dflash2-model \
+  --num-speculative-tokens 3 \
+  --expect-gdn-reuse \
+  --output-dir /tmp/dflash2-gdn-stage3
+```
+
+对于当前每轮 10 个等价 GDN group 的模型，预期：
+
+- `gdn_full_builds_per_metadata_call == 1`；
+- `gdn_updates_per_metadata_call == 9`；
+- `gdn_block_table_update.calls == group_updates_checked` 的阶段 2 对照值；
+- 四象限 token IDs 仍完全一致。
+
+阶段 2 的 `--verify-gdn-update` 会自动关闭真实复用，以保留后续 group 的完整 build
+作为参考。若现场需要快速回退阶段 3，可在启动进程前设置：
+
+```bash
+export VLLM_KUNLUN_DISABLE_GDN_METADATA_REUSE=1
+```
+
+该开关只关闭跨 group metadata reuse，阶段 1 已完成的 CPU mirror 和异步传输优化仍然
+保留。
