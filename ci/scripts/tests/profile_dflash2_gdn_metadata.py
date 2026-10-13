@@ -379,7 +379,7 @@ def _run_worker(args: argparse.Namespace) -> None:
         tensor_parallel_size=args.tensor_parallel_size,
         max_model_len=args.max_model_len,
         max_num_seqs=max(args.batch_size, args.max_num_seqs),
-        enforce_eager=False,
+        enforce_eager=args.target_eager,
         dtype=args.dtype,
         seed=args.seed,
         async_scheduling=args.async_scheduling == "on",
@@ -447,6 +447,7 @@ def _run_worker(args: argparse.Namespace) -> None:
             "draft_model": args.draft_model,
             "async_scheduling": args.async_scheduling == "on",
             "dflash2_full_graph": args.full_graph == "on",
+            "target_eager": args.target_eager,
             "tensor_parallel_size": args.tensor_parallel_size,
             "dtype": args.dtype,
             "seed": args.seed,
@@ -565,6 +566,8 @@ def _run_matrix(args: argparse.Namespace) -> None:
                 command.append("--verify-gdn-update")
             if args.expect_gdn_reuse:
                 command.append("--expect-gdn-reuse")
+            if args.target_eager:
+                command.append("--target-eager")
 
             print(f"\n=== {case_name} ===", flush=True)
             subprocess.run(command, check=True)
@@ -607,6 +610,11 @@ def _parse_args() -> argparse.Namespace:
         "--async-scheduling", choices=("off", "on", "both"), default="both"
     )
     parser.add_argument("--full-graph", choices=("off", "on", "both"), default="both")
+    parser.add_argument(
+        "--target-eager",
+        action="store_true",
+        help="Disable target-model CUDAGraphs for correctness bisection",
+    )
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--max-num-seqs", type=int, default=2)
