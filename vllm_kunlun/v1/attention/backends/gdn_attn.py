@@ -856,9 +856,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         """Rebuild only group-specific state indices for another KV group.
 
         Batch-level fields stay shared with ``metadata``. Device indices are
-        always derived from the device block table and Kunlun host-pointer
-        inputs are derived independently from vLLM's persistent CPU mirror;
-        this path must never hide a per-group D2H synchronization.
+        always derived from the device block table. When a kernel consumes
+        host indices, they are derived independently from vLLM's persistent
+        CPU mirror; this path must never hide a per-group D2H synchronization.
+
+        Pure speculative decode consumes only device state indices. Avoid
+        materializing its unused CPU mirrors: apart from wasting host work,
+        keeping them in reusable pinned buffers would violate the host-pointer
+        lifetime required by Kunlun kernels that actually consume CPU inputs.
         """
         del slot_mapping  # GDN addresses state pages through the block table.
         cache_mode = self.vllm_config.cache_config.mamba_cache_mode
@@ -868,15 +873,21 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 f"mamba_cache_mode='none'/'all', got {cache_mode!r}"
             )
 
-        cpu_block_table = _cpu_state_block_table(blk_table, cache_mode)
-        if cpu_block_table is None:
-            raise RuntimeError(
-                "GDN metadata reuse requires the registered CPU block-table "
-                "mirror; refusing to fall back to a device-to-host copy"
-            )
-
         m = metadata
         masks = m.spec_sequence_masks_cpu
+        pure_spec_decode = (
+            masks is not None and m.num_prefills == 0 and m.num_decodes == 0
+        )
+        cpu_block_table = None
+        if not pure_spec_decode:
+            cpu_block_table = _cpu_state_block_table(blk_table, cache_mode)
+            if cpu_block_table is None:
+                raise RuntimeError(
+                    "GDN metadata reuse requires the registered CPU block-table "
+                    "mirror for non-spec metadata; refusing to fall back to a "
+                    "device-to-host copy"
+                )
+
         spec_indices: torch.Tensor | None = None
         spec_indices_cpu: torch.Tensor | None = None
         spec_conv_indices: torch.Tensor | None = None
@@ -885,6 +896,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         non_spec_indices_cpu: torch.Tensor | None = None
 
         if masks is None:
+            assert cpu_block_table is not None
             assert m.non_spec_state_indices_tensor is not None
             num_rows = m.non_spec_state_indices_tensor.shape[0]
             non_spec_indices = blk_table[:num_rows, 0].contiguous()
@@ -896,13 +908,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
                 non_spec_indices_cpu.masked_fill_(padded_rows, NULL_BLOCK_ID)
         else:
-            if m.num_prefills == 0 and m.num_decodes == 0:
+            if pure_spec_decode:
                 # Padded rows trail real speculative decodes.
                 spec_indices = blk_table[: m.num_spec_decodes, : self.num_spec + 1]
-                spec_source_cpu = cpu_block_table[
-                    : m.num_spec_decodes, : self.num_spec + 1
-                ]
             else:
+                assert cpu_block_table is not None
                 non_spec_masks = self.non_spec_sequence_masks_cpu[: masks.numel()]
                 torch.logical_not(masks, out=non_spec_masks)
                 spec_indices = blk_table[masks, : self.num_spec + 1]
@@ -916,22 +926,19 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     )
                     non_spec_indices_cpu.masked_fill_(padded_rows, NULL_BLOCK_ID)
 
-            spec_indices_cpu = spec_source_cpu.contiguous()
-            spec_conv_indices = spec_indices[:, 0].to(torch.int32).contiguous()
-            spec_conv_indices_cpu = spec_indices_cpu[:, 0].contiguous()
+                spec_indices_cpu = spec_source_cpu.contiguous()
+                spec_conv_indices_cpu = spec_indices_cpu[:, 0].contiguous()
 
-        if m.spec_pad_gather_idx is None and self._stage_spec_decode(
+        stage_spec_decode = m.spec_pad_gather_idx is None and self._stage_spec_decode(
             m.num_prefills,
             m.num_decodes,
             m.num_spec_decodes,
             m.num_spec_decode_tokens,
-        ):
+        )
+        if stage_spec_decode:
             assert m.spec_state_indices_tensor is not None
             assert spec_indices is not None
             assert m.spec_conv_state_indices_tensor is not None
-            assert spec_conv_indices is not None
-            assert m.spec_conv_state_indices_tensor_cpu is not None
-            assert spec_conv_indices_cpu is not None
 
             state_rows = m.spec_state_indices_tensor.shape[0]
             self.spec_state_indices_tensor[: m.num_spec_decodes].copy_(
@@ -942,16 +949,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
             conv_rows = m.spec_conv_state_indices_tensor.shape[0]
             self.spec_conv_state_indices_tensor[: m.num_spec_decodes].copy_(
-                spec_conv_indices, non_blocking=True
+                spec_indices[:, 0], non_blocking=True
             )
             spec_conv_indices = self.spec_conv_state_indices_tensor[:conv_rows]
             spec_conv_indices[m.num_spec_decodes :].fill_(0)
-
-            conv_cpu_rows = m.spec_conv_state_indices_tensor_cpu.shape[0]
-            spec_conv_indices_cpu = self.spec_conv_state_indices_tensor_cpu[
-                :conv_cpu_rows
-            ]
-            spec_conv_indices_cpu[m.num_spec_decodes :].fill_(0)
+        elif spec_indices is not None:
+            # Non-graph execution still requires a contiguous device vector,
+            # but it does not need an intermediate when staging graph buffers.
+            spec_conv_indices = spec_indices[:, 0].to(torch.int32).contiguous()
 
         if self._stage_decode(m.num_prefills, m.num_decodes, m.num_spec_decodes):
             assert m.non_spec_state_indices_tensor is not None

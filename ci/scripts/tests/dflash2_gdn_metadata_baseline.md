@@ -92,7 +92,9 @@ python ci/scripts/tests/profile_dflash2_gdn_metadata.py \
 验证模式会产生额外 clone 和 device 同步，只用于正确性检查，不能用其 latency 或
 throughput 评价性能。每个 case 的 JSON 中
 `metrics.gdn_update_equivalence.group_updates_checked` 必须大于 0；任一字段或地址不一致
-会立即抛出异常。
+会立即抛出异常。纯 speculative decode 的两个 CPU spec-state 字段没有消费者，优化后
+`update_block_table()` 必须保持它们为 `None`；验证器对此检查“未物化”，其余 device
+state 和 non-spec CPU state 仍与完整 build 逐项比较。
 
 ## 阶段 3：启用跨 KV group 复用
 

@@ -94,6 +94,10 @@ class Timings:
 class GDNUpdateEquivalenceVerifier:
     """Compare Stage-2 block-table updates with the full build they replace."""
 
+    _PURE_SPEC_UNUSED_CPU_FIELDS = (
+        "spec_state_indices_tensor_cpu",
+        "spec_conv_state_indices_tensor_cpu",
+    )
     _STATE_FIELDS = (
         "spec_state_indices_tensor",
         "spec_state_indices_tensor_cpu",
@@ -219,6 +223,16 @@ class GDNUpdateEquivalenceVerifier:
         if updated is source_metadata:
             raise AssertionError("GDN update mutated and returned the source metadata")
         for name, expected_value in expected.items():
+            if (
+                metadata.num_prefills == 0
+                and metadata.num_decodes == 0
+                and name in self._PURE_SPEC_UNUSED_CPU_FIELDS
+            ):
+                if getattr(updated, name) is not None:
+                    raise AssertionError(
+                        f"unused pure-spec CPU field {name} was materialized"
+                    )
+                continue
             self._assert_same_tensor(name, expected_value, getattr(updated, name))
         for name, source_value in source_state.items():
             self._assert_same_tensor(
