@@ -187,11 +187,14 @@ class _GDNCommonGraphBuffers:
             with_numpy=False,
         )
         token_capacity = decode_cudagraph_max_bs * (num_spec + 1)
-        self.spec_token_masks = torch.empty(
+        # Pure speculative decode always consumes every packed token in order.
+        # Initialize these invariant buffers once instead of regenerating and
+        # copying arange/all-true tensors on every metadata build.
+        self.spec_token_masks = torch.ones(
             (token_capacity,), dtype=torch.bool, device=device
         )
-        self.spec_token_indx = torch.empty(
-            (token_capacity,), dtype=torch.int32, device=device
+        self.spec_token_indx = torch.arange(
+            token_capacity, dtype=torch.int32, device=device
         )
         self.non_spec_token_indx = torch.empty(
             (token_capacity,), dtype=torch.int32, device=device
@@ -415,7 +418,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
-        context_lens_tensor = m.compute_num_computed_tokens()
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
         cache_mode = self.vllm_config.cache_config.mamba_cache_mode
         block_table_tensor = mamba_get_block_table_tensor(
@@ -424,14 +426,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.kv_cache_spec,
             cache_mode,
         )
-        cpu_block_table = _cpu_state_block_table(m.block_table_tensor, cache_mode)
+        cpu_block_table: torch.Tensor | None = None
         spec_conv_state_indices_tensor: torch.Tensor | None = None
         spec_conv_state_indices_tensor_cpu: torch.Tensor | None = None
         spec_sequence_masks_cpu: torch.Tensor | None = None
         spec_pad_gather_idx: torch.Tensor | None = None
         spec_unpad_idx: torch.Tensor | None = None
-        # [Kunlun] These CPU mirrors are only produced on some branches below but
-        # are always read when the metadata is built, so default them here.
+        pure_spec_decode = False
+        # Only host-consuming compatibility branches populate these mirrors;
+        # pure speculative decode intentionally leaves them absent.
         spec_state_indices_tensor_cpu: torch.Tensor | None = None
         non_spec_state_indices_tensor_cpu: torch.Tensor | None = None
         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
@@ -456,7 +459,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_sequence_masks = None
                 spec_sequence_masks_cpu = None
             else:
-                self._spec_sequence_masks.copy_to_gpu(num_mask_rows)
+                # The pure-spec path fills the persistent device mask directly
+                # once its row layout is known. Mixed batches still copy the
+                # exact CPU mask below.
                 spec_sequence_masks = self.spec_sequence_masks[:num_mask_rows]
 
         if spec_sequence_masks is None:
@@ -475,6 +480,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             # this, logical indices [45, 61] are read as physical neighbors
             # [45, 46] by the batched state-scatter path.
             non_spec_state_indices_tensor = block_table_tensor[:, 0].contiguous()
+            cpu_block_table = _cpu_state_block_table(m.block_table_tensor, cache_mode)
             if cpu_block_table is not None:
                 num_state_rows = non_spec_state_indices_tensor.size(0)
                 non_spec_state_indices_tensor_cpu = cpu_block_table[
@@ -527,36 +533,24 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 num_decodes = 0
                 num_decode_tokens = 0
 
-            if num_prefills == 0 and num_decodes == 0:
-                spec_token_size = min(
-                    num_spec_decodes * (self.num_spec + 1),
-                    query_start_loc_cpu[-1].item(),
-                )
-                spec_token_indx = torch.arange(
-                    spec_token_size,
-                    dtype=torch.int32,
-                    device=query_start_loc.device,
-                )
-                # [Kunlun] all tokens are spec tokens in this branch
-                spec_token_masks = torch.ones(
-                    spec_token_size,
-                    dtype=torch.bool,
-                    device=query_start_loc.device,
-                )
-                non_spec_token_indx = torch.empty(
-                    0, dtype=torch.int32, device=query_start_loc.device
-                )
-                # Padded rows trail the real speculative decodes, so slicing
-                # avoids the host-mask gather (implicit H2D + device kernel).
+            pure_spec_decode = num_prefills == 0 and num_decodes == 0
+            if pure_spec_decode:
+                # Padded rows trail real speculative decodes. Generate all
+                # common pure-spec tensors directly in their persistent
+                # buffers, avoiding temporary device allocations followed by
+                # copies into the same graph-stable buffers below.
+                spec_sequence_masks[:num_spec_decodes].fill_(True)
+                spec_sequence_masks[num_spec_decodes:].fill_(False)
+                spec_token_size = int(num_spec_decode_tokens)
+                spec_token_indx = self.spec_token_indx[:spec_token_size]
+                spec_token_masks = self.spec_token_masks[:spec_token_size]
+                non_spec_token_indx = self.non_spec_token_indx[:0]
                 spec_state_indices_tensor = block_table_tensor[
                     :num_spec_decodes, : self.num_spec + 1
                 ]
-                if cpu_block_table is not None:
-                    spec_state_indices_tensor_cpu = cpu_block_table[
-                        :num_spec_decodes, : self.num_spec + 1
-                    ].contiguous()
-                else:
-                    spec_state_indices_tensor_cpu = spec_state_indices_tensor
+                # No pure-spec kernel consumes host state indices. Keep these
+                # fields absent rather than doing CPU mirror lookup/allocation.
+                spec_state_indices_tensor_cpu = None
                 non_spec_state_indices_tensor = None
                 # Padded sequences are always at the back, so the first
                 # num_spec_decodes + 1 entries of query_start_loc already
@@ -565,6 +559,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 non_spec_query_start_loc = None
                 non_spec_query_start_loc_cpu = None
             else:
+                # Mixed batches need the exact request mask on device and host
+                # state indices for their non-spec kernels.
+                self._spec_sequence_masks.copy_to_gpu(spec_sequence_masks_cpu.numel())
+                cpu_block_table = _cpu_state_block_table(
+                    m.block_table_tensor, cache_mode
+                )
                 spec_token_masks = torch.repeat_interleave(
                     spec_sequence_masks,
                     query_lens,
@@ -634,9 +634,17 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             else:
                 num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
 
-            pad_indices = build_spec_pad_indices(
-                query_lens_cpu[spec_sequence_masks_cpu], self.num_spec + 1
-            )
+            # Every speculative query is bounded by ``num_spec + 1``. If the
+            # total reaches that upper bound, every row is uniform and the
+            # padded-conv fallback cannot be needed.
+            if pure_spec_decode and num_spec_decode_tokens == num_spec_decodes * (
+                self.num_spec + 1
+            ):
+                pad_indices = None
+            else:
+                pad_indices = build_spec_pad_indices(
+                    query_lens_cpu[spec_sequence_masks_cpu], self.num_spec + 1
+                )
             if pad_indices is not None:
                 logger.warning_once(
                     "[KunlunPlugin] GDN spec decode hit non-uniform query "
@@ -671,6 +679,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             )
 
         if num_prefills > 0:
+            # Upstream main also defers this device computation to prefill;
+            # decode-only metadata never consumes context lengths.
+            context_lens_tensor = m.compute_num_computed_tokens()
             has_initial_state = context_lens_tensor > 0
             if spec_sequence_masks_cpu is not None:
                 has_initial_state = has_initial_state[non_spec_sequence_masks_cpu]
@@ -709,45 +720,24 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.spec_conv_state_indices_tensor[:num_spec_decodes].copy_(
                 spec_state_indices_tensor[:, 0], non_blocking=True
             )
-            self.spec_conv_state_indices_tensor_cpu[:num_spec_decodes].copy_(
-                spec_state_indices_tensor_cpu[:num_spec_decodes, 0]
-                if spec_state_indices_tensor_cpu is not None
-                else spec_state_indices_tensor[:, 0].to(device="cpu", dtype=torch.int32)
-            )
             spec_state_indices_tensor = self.spec_state_indices_tensor[:batch_size]
             spec_state_indices_tensor[num_spec_decodes:].fill_(NULL_BLOCK_ID)
             spec_conv_state_indices_tensor = self.spec_conv_state_indices_tensor[
                 :batch_size
             ]
             spec_conv_state_indices_tensor[num_spec_decodes:].fill_(0)
-            spec_conv_state_indices_tensor_cpu = (
-                self.spec_conv_state_indices_tensor_cpu[:batch_size]
-            )
-            spec_conv_state_indices_tensor_cpu[num_spec_decodes:].fill_(0)
-            self.spec_sequence_masks[:num_spec_decodes].copy_(
-                spec_sequence_masks[:num_spec_decodes], non_blocking=True
-            )
             spec_sequence_masks = self.spec_sequence_masks[:batch_size]
             spec_sequence_masks[:num_spec_decodes].fill_(True)
             spec_sequence_masks[num_spec_decodes:].fill_(False)
 
             assert spec_token_masks is not None
-            self.spec_token_masks[: spec_token_masks.size(0)].copy_(
-                spec_token_masks, non_blocking=True
-            )
             spec_token_masks = self.spec_token_masks[: spec_token_masks.size(0)]
 
             assert non_spec_token_indx is not None and spec_token_indx is not None
-            self.non_spec_token_indx[: non_spec_token_indx.size(0)].copy_(
-                non_spec_token_indx, non_blocking=True
-            )
             non_spec_token_indx = self.non_spec_token_indx[
                 : non_spec_token_indx.size(0)
             ]
 
-            self.spec_token_indx[: spec_token_indx.size(0)].copy_(
-                spec_token_indx, non_blocking=True
-            )
             spec_token_indx = self.spec_token_indx[: spec_token_indx.size(0)]
 
             self.spec_query_start_loc[: num_spec_decodes + 1].copy_(
@@ -766,11 +756,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_conv_state_indices_tensor = (
                 spec_state_indices_tensor[:, 0].to(torch.int32).contiguous()
             )
-            spec_conv_state_indices_tensor_cpu = (
-                spec_state_indices_tensor_cpu[:, 0].contiguous()
-                if spec_state_indices_tensor_cpu is not None
-                else _to_cpu(spec_conv_state_indices_tensor)
-            )
+            if not pure_spec_decode:
+                spec_conv_state_indices_tensor_cpu = (
+                    spec_state_indices_tensor_cpu[:, 0].contiguous()
+                    if spec_state_indices_tensor_cpu is not None
+                    else _to_cpu(spec_conv_state_indices_tensor)
+                )
             assert num_accepted_tokens is not None
             num_accepted_tokens = num_accepted_tokens.to(dtype=torch.int32)
 
@@ -813,12 +804,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_query_start_loc=non_spec_query_start_loc,
             non_spec_query_start_loc_cpu=non_spec_query_start_loc_cpu,
             spec_state_indices_tensor=spec_state_indices_tensor,
-            # [Kunlun] These locals are named ``*_cpu`` but are produced by
-            # indexing the *device* ``block_table_tensor`` (see the branches
-            # above), so they can still live on the device. The consumers hand
-            # them to kunlun ops as host pointers, so they must be forced to CPU
-            # -- passing a device tensor there faults with
-            # "an illegal memory access was encountered".
+            # Pure spec decode has no host-state consumer and keeps these
+            # fields None. Compatibility paths may still derive them from a
+            # device block table, so force only those values onto the host.
             spec_state_indices_tensor_cpu=_to_cpu(spec_state_indices_tensor_cpu),
             spec_conv_state_indices_tensor=spec_conv_state_indices_tensor,
             spec_conv_state_indices_tensor_cpu=_to_cpu(
