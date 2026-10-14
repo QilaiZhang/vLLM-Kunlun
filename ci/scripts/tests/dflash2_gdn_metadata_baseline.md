@@ -128,3 +128,64 @@ export VLLM_KUNLUN_DISABLE_GDN_METADATA_REUSE=1
 
 该开关只关闭跨 group metadata reuse，阶段 1 已完成的 CPU mirror 和异步传输优化仍然
 保留。
+
+## 扩展精度矩阵
+
+`--precision-suite` 使用独立进程覆盖普通生成与 speculative generation 的更多调度和
+图执行形态：
+
+| case | 重点覆盖 |
+| --- | --- |
+| `regular-b1` | batch 1 普通 prefill/decode |
+| `regular-b3-graph-padding` | 普通 decode 的 graph padding row |
+| `spec-b1` | batch 1 prefill 与纯 speculative decode |
+| `spec-b3-graph-padding` | speculative decode 的 graph padding row |
+| `spec-b4-async` | 多 batch + async scheduling + FULL graph |
+| `spec-b2-target-eager` | target eager + drafter 非 FULL graph |
+| `spec-b2-mixed-prefill` | chunked prefill 与 speculative decode 混合 batch |
+
+本轮矩阵不改变或比较 `mamba_cache_mode`。每个 case 除了保存 token IDs，还会记录
+`metrics.gdn_metadata_paths`；如果配置没有实际命中声明的 prefill、decode、pure-spec、
+mixed 或 graph-padding 路径，worker 会直接失败，避免名义覆盖。
+
+四象限内部一致只能证明不同执行模式彼此一致，不能排除它们共同出错。扩展矩阵应先用
+已知正确的 `c4c2b50` 代码和同一份最新版脚本生成外部基线，再在当前分支逐 token
+比较。建议把脚本复制到代码 checkout 之外，确保两个 revision 执行完全相同的 case：
+
+```bash
+cp ci/scripts/tests/profile_dflash2_gdn_metadata.py /tmp/profile_dflash2_gdn_metadata.py
+
+# 在安装了已知正确 c4c2b50 的环境中生成 reference；不要加 --expect-gdn-reuse。
+python /tmp/profile_dflash2_gdn_metadata.py \
+  --target-model /path/to/target-model \
+  --draft-model /path/to/dflash2-model \
+  --num-speculative-tokens 3 \
+  --warmup-iterations 1 \
+  --iterations 2 \
+  --precision-suite \
+  --output-dir /tmp/gdn-precision-reference
+
+# 切回并安装本分支后，与 reference 逐 case、逐轮、逐请求、逐 token 比较。
+python ci/scripts/tests/profile_dflash2_gdn_metadata.py \
+  --target-model /path/to/target-model \
+  --draft-model /path/to/dflash2-model \
+  --num-speculative-tokens 3 \
+  --warmup-iterations 1 \
+  --iterations 2 \
+  --precision-suite \
+  --expect-gdn-reuse \
+  --reference-dir /tmp/gdn-precision-reference \
+  --output-dir /tmp/gdn-precision-candidate
+```
+
+`precision-summary.json` 中以下字段必须成立：
+
+- `all_cases_deterministic == true`；
+- `all_cases_match_external_reference == true`；
+- 每个 case 的 `gdn_metadata_paths.total` 包含其要求的路径；
+- 当前 10 个等价 GDN group 的模型中，每个 case 应保持一次 full build 加九次 update，
+  即 `gdn_full_builds_per_metadata_call == 1`、
+  `gdn_updates_per_metadata_call == 9`。
+
+若只需为原四象限增加外部基线校验，也可直接给原命令增加
+`--reference-dir /path/to/stage0-json-dir`；文件名必须与对应 case 相同。

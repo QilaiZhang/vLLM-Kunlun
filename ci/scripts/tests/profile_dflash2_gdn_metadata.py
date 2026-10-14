@@ -38,6 +38,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -51,6 +52,16 @@ PROMPTS = (
     "A healthy morning routine can begin with",
     "Translate 'good morning' to Chinese:",
     "The next number in 1, 1, 2, 3, 5 is",
+)
+
+STAGGERED_PROMPTS = (
+    "Explain gravity briefly:",
+    (
+        "Give a detailed numbered scientific explanation of stellar evolution, "
+        "including molecular clouds, protostars, main-sequence fusion, red giants, "
+        "supernovae, white dwarfs, neutron stars, and black holes. "
+    )
+    * 12,
 )
 
 
@@ -89,6 +100,71 @@ class Timings:
             "p95_ms": ordered[p95_index],
             "max_ms": max(values_ms),
         }
+
+
+@dataclass
+class MetadataPathCoverage:
+    """Record which GDN metadata branches a measured run actually executes."""
+
+    build: Counter[str] = field(default_factory=Counter)
+    update: Counter[str] = field(default_factory=Counter)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    @staticmethod
+    def _paths(metadata: Any) -> set[str]:
+        paths: set[str] = set()
+        num_prefills = metadata.num_prefills
+        num_decodes = metadata.num_decodes
+        num_spec_decodes = metadata.num_spec_decodes
+
+        if num_prefills > 0:
+            paths.add("prefill")
+            if num_spec_decodes > 0:
+                paths.add("mixed_prefill_spec")
+        if num_decodes > 0:
+            paths.add("decode")
+        if num_spec_decodes > 0 and num_prefills == 0 and num_decodes == 0:
+            paths.add("pure_spec")
+        if metadata.spec_pad_gather_idx is not None:
+            paths.add("variable_spec")
+
+        # FULL graph metadata is padded to the selected capture size.  Prove
+        # that at least one measured step contains inactive graph rows instead
+        # of assuming max_num_seqs alone exercised the padding path.
+        spec_masks = metadata.spec_sequence_masks
+        if (
+            spec_masks is not None
+            and num_prefills == 0
+            and num_decodes == 0
+            and spec_masks.shape[0] > num_spec_decodes
+        ):
+            paths.add("graph_padding")
+        non_spec_states = metadata.non_spec_state_indices_tensor
+        if (
+            non_spec_states is not None
+            and num_prefills == 0
+            and num_spec_decodes == 0
+            and non_spec_states.shape[0] > num_decodes
+        ):
+            paths.add("graph_padding")
+        return paths
+
+    def observe(self, operation: str, metadata: Any) -> None:
+        with self.lock:
+            counter = self.build if operation == "build" else self.update
+            counter.update(self._paths(metadata))
+
+    def reset(self) -> None:
+        with self.lock:
+            self.build.clear()
+            self.update.clear()
+
+    def summary(self) -> dict[str, dict[str, int]]:
+        with self.lock:
+            build = dict(sorted(self.build.items()))
+            update = dict(sorted(self.update.items()))
+            total = dict(sorted((self.build + self.update).items()))
+        return {"build": build, "update": update, "total": total}
 
 
 class GDNUpdateEquivalenceVerifier:
@@ -263,7 +339,13 @@ def _timed_method(method: Callable[..., Any], timings: Timings) -> Callable[...,
 
 def _install_timing_hooks(
     verify_gdn_update: bool,
-) -> tuple[Timings, Timings, Timings, GDNUpdateEquivalenceVerifier | None]:
+) -> tuple[
+    Timings,
+    Timings,
+    Timings,
+    GDNUpdateEquivalenceVerifier | None,
+    MetadataPathCoverage,
+]:
     # Import only in the worker, after its environment has been fixed and
     # before constructing LLM/GPUModelRunner instances. Import Kunlun's GDN
     # implementation first: it replaces the upstream module symbol, which the
@@ -278,6 +360,7 @@ def _install_timing_hooks(
     gdn_build = Timings()
     gdn_update = Timings()
     verifier = GDNUpdateEquivalenceVerifier() if verify_gdn_update else None
+    path_coverage = MetadataPathCoverage()
     runner_method = _timed_method(
         GPUModelRunner._build_attention_metadata, attention_metadata
     )
@@ -295,12 +378,19 @@ def _install_timing_hooks(
     @functools.wraps(build_method)
     def wrapped_build(*args: Any, **kwargs: Any) -> Any:
         metadata = build_method(*args, **kwargs)
+        path_coverage.observe("build", metadata)
         if verifier is not None:
             builder = args[0]
             common_metadata = kwargs.get("common_attn_metadata")
             if common_metadata is None:
                 common_metadata = args[2]
             verifier.observe(builder, metadata, common_metadata)
+        return metadata
+
+    @functools.wraps(update_method)
+    def wrapped_update(*args: Any, **kwargs: Any) -> Any:
+        metadata = update_method(*args, **kwargs)
+        path_coverage.observe("update", metadata)
         return metadata
 
     setattr(
@@ -316,9 +406,9 @@ def _install_timing_hooks(
     setattr(
         GDNAttentionMetadataBuilder,
         "update_block_table",
-        update_method,
+        wrapped_update,
     )
-    return attention_metadata, gdn_build, gdn_update, verifier
+    return attention_metadata, gdn_build, gdn_update, verifier, path_coverage
 
 
 def _maybe_start_xprofiler(enabled: bool) -> Any | None:
@@ -370,9 +460,13 @@ def _run_worker(args: argparse.Namespace) -> None:
         )
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "INFO")
 
-    attention_metadata, gdn_build, gdn_update, update_verifier = _install_timing_hooks(
-        args.verify_gdn_update
-    )
+    (
+        attention_metadata,
+        gdn_build,
+        gdn_update,
+        update_verifier,
+        path_coverage,
+    ) = _install_timing_hooks(args.verify_gdn_update)
 
     import torch
     from vllm import LLM, SamplingParams
@@ -380,24 +474,34 @@ def _run_worker(args: argparse.Namespace) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("Run the worker on a Kunlun CUDA-compatible device")
 
-    prompts = list(PROMPTS[: args.batch_size])
+    prompt_pool = STAGGERED_PROMPTS if args.prompt_set == "staggered" else PROMPTS
+    prompts = list(prompt_pool[: args.batch_size])
     if len(prompts) != args.batch_size:
-        raise ValueError(f"--batch-size must be between 1 and {len(PROMPTS)}")
+        raise ValueError(
+            f"--batch-size must be between 1 and {len(prompt_pool)} for "
+            f"--prompt-set={args.prompt_set}"
+        )
 
-    llm = LLM(
-        model=args.target_model,
-        speculative_config={
+    llm_kwargs: dict[str, Any] = {
+        "model": args.target_model,
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "max_model_len": args.max_model_len,
+        "max_num_seqs": max(args.batch_size, args.max_num_seqs),
+        "enforce_eager": args.target_eager,
+        "dtype": args.dtype,
+        "seed": args.seed,
+        "async_scheduling": args.async_scheduling == "on",
+    }
+    if not args.disable_speculative:
+        llm_kwargs["speculative_config"] = {
             "model": args.draft_model,
             "num_speculative_tokens": args.num_speculative_tokens,
-        },
-        tensor_parallel_size=args.tensor_parallel_size,
-        max_model_len=args.max_model_len,
-        max_num_seqs=max(args.batch_size, args.max_num_seqs),
-        enforce_eager=args.target_eager,
-        dtype=args.dtype,
-        seed=args.seed,
-        async_scheduling=args.async_scheduling == "on",
-    )
+        }
+    if args.max_num_batched_tokens is not None:
+        llm_kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
+    if args.enable_chunked_prefill:
+        llm_kwargs["enable_chunked_prefill"] = True
+    llm = LLM(**llm_kwargs)
     sampling_params = SamplingParams(
         temperature=0.0,
         max_tokens=args.max_tokens,
@@ -412,6 +516,7 @@ def _run_worker(args: argparse.Namespace) -> None:
     attention_metadata.reset()
     gdn_build.reset()
     gdn_update.reset()
+    path_coverage.reset()
     if update_verifier is not None:
         update_verifier.reset()
     profiler = _maybe_start_xprofiler(args.xprofiler)
@@ -438,6 +543,17 @@ def _run_worker(args: argparse.Namespace) -> None:
     metadata_summary = attention_metadata.summary()
     gdn_summary = gdn_build.summary()
     gdn_update_summary = gdn_update.summary()
+    path_summary = path_coverage.summary()
+    missing_paths = [
+        path
+        for path in args.require_gdn_path
+        if path_summary["total"].get(path, 0) == 0
+    ]
+    if missing_paths:
+        raise AssertionError(
+            "Required GDN metadata paths were not observed: "
+            f"{missing_paths}; observed={path_summary['total']}"
+        )
     if args.expect_gdn_reuse:
         if gdn_summary["calls"] != metadata_summary["calls"]:
             raise AssertionError(
@@ -459,6 +575,7 @@ def _run_worker(args: argparse.Namespace) -> None:
         "config": {
             "target_model": args.target_model,
             "draft_model": args.draft_model,
+            "speculative_enabled": not args.disable_speculative,
             "async_scheduling": args.async_scheduling == "on",
             "dflash2_full_graph": args.full_graph == "on",
             "target_eager": args.target_eager,
@@ -468,6 +585,9 @@ def _run_worker(args: argparse.Namespace) -> None:
             "batch_size": args.batch_size,
             "max_num_seqs": max(args.batch_size, args.max_num_seqs),
             "max_model_len": args.max_model_len,
+            "max_num_batched_tokens": args.max_num_batched_tokens,
+            "enable_chunked_prefill": args.enable_chunked_prefill,
+            "prompt_set": args.prompt_set,
             "num_speculative_tokens": args.num_speculative_tokens,
             "max_tokens": args.max_tokens,
             "warmup_iterations": args.warmup_iterations,
@@ -485,6 +605,7 @@ def _run_worker(args: argparse.Namespace) -> None:
             "gdn_update_equivalence": (
                 update_verifier.summary() if update_verifier is not None else None
             ),
+            "gdn_metadata_paths": path_summary,
             "gdn_full_builds_per_metadata_call": (
                 gdn_summary["calls"] / metadata_summary["calls"]
                 if metadata_summary["calls"]
@@ -531,6 +652,123 @@ def _case_name(async_scheduling: str, full_graph: str) -> str:
     return f"async-{async_scheduling}_full-graph-{full_graph}"
 
 
+def _worker_command(
+    args: argparse.Namespace,
+    result_path: Path,
+    overrides: dict[str, Any] | None = None,
+) -> list[str]:
+    values = vars(args) | (overrides or {})
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--worker",
+        "--target-model",
+        args.target_model,
+        "--draft-model",
+        args.draft_model,
+        "--async-scheduling",
+        values["async_scheduling"],
+        "--full-graph",
+        values["full_graph"],
+        "--output",
+        str(result_path),
+    ]
+    for name in (
+        "tensor_parallel_size",
+        "batch_size",
+        "max_num_seqs",
+        "max_model_len",
+        "num_speculative_tokens",
+        "max_tokens",
+        "warmup_iterations",
+        "iterations",
+        "seed",
+    ):
+        command.extend((f"--{name.replace('_', '-')}", str(values[name])))
+    if values.get("max_num_batched_tokens") is not None:
+        command.extend(
+            ("--max-num-batched-tokens", str(values["max_num_batched_tokens"]))
+        )
+    command.extend(("--dtype", values["dtype"]))
+    command.extend(("--prompt-set", values.get("prompt_set", "default")))
+    for path in values.get("require_gdn_path", ()):
+        command.extend(("--require-gdn-path", path))
+    for enabled, flag in (
+        (values.get("xprofiler"), "--xprofiler"),
+        (values.get("verify_gdn_update"), "--verify-gdn-update"),
+        (values.get("expect_gdn_reuse"), "--expect-gdn-reuse"),
+        (values.get("target_eager"), "--target-eager"),
+        (values.get("disable_speculative"), "--disable-speculative"),
+        (values.get("enable_chunked_prefill"), "--enable-chunked-prefill"),
+    ):
+        if enabled:
+            command.append(flag)
+    return command
+
+
+def _tokens_are_deterministic(result: dict[str, Any]) -> bool:
+    iterations = result["token_ids_by_iteration"]
+    return bool(iterations) and all(
+        tokens == iterations[0] for tokens in iterations[1:]
+    )
+
+
+def _assert_external_reference(
+    case_name: str, result: dict[str, Any], reference_dir: Path
+) -> None:
+    reference_path = reference_dir / f"{case_name}.json"
+    if not reference_path.is_file():
+        raise FileNotFoundError(f"Missing external reference: {reference_path}")
+    reference = json.loads(reference_path.read_text(encoding="utf-8"))
+    if result["prompts"] != reference.get("prompts"):
+        raise AssertionError(f"{case_name}: prompts differ from external reference")
+    comparable_config = (
+        "speculative_enabled",
+        "async_scheduling",
+        "dflash2_full_graph",
+        "target_eager",
+        "tensor_parallel_size",
+        "dtype",
+        "seed",
+        "batch_size",
+        "max_num_seqs",
+        "max_model_len",
+        "max_num_batched_tokens",
+        "enable_chunked_prefill",
+        "prompt_set",
+        "num_speculative_tokens",
+        "max_tokens",
+        "warmup_iterations",
+        "iterations",
+    )
+    for name in comparable_config:
+        if result["config"].get(name) != reference.get("config", {}).get(name):
+            raise AssertionError(
+                f"{case_name}: config.{name} differs from external reference: "
+                f"candidate={result['config'].get(name)!r}, "
+                f"reference={reference.get('config', {}).get(name)!r}"
+            )
+    actual_tokens = result["token_ids_by_iteration"]
+    expected_tokens = reference.get("token_ids_by_iteration")
+    if actual_tokens != expected_tokens:
+        for iteration, (actual_batch, expected_batch) in enumerate(
+            zip(actual_tokens, expected_tokens or [])
+        ):
+            if actual_batch == expected_batch:
+                continue
+            for request, (actual, expected) in enumerate(
+                zip(actual_batch, expected_batch)
+            ):
+                if actual != expected:
+                    raise AssertionError(
+                        f"{case_name}: token mismatch at iteration={iteration}, "
+                        f"request={request}: candidate={actual}, reference={expected}"
+                    )
+        raise AssertionError(
+            f"{case_name}: token output shape differs from external reference"
+        )
+
+
 def _run_matrix(args: argparse.Namespace) -> None:
     async_modes = (
         ("off", "on") if args.async_scheduling == "both" else (args.async_scheduling,)
@@ -544,44 +782,11 @@ def _run_matrix(args: argparse.Namespace) -> None:
         for graph_mode in graph_modes:
             case_name = _case_name(async_mode, graph_mode)
             result_path = output_dir / f"{case_name}.json"
-            command = [
-                sys.executable,
-                str(Path(__file__).resolve()),
-                "--worker",
-                "--target-model",
-                args.target_model,
-                "--draft-model",
-                args.draft_model,
-                "--async-scheduling",
-                async_mode,
-                "--full-graph",
-                graph_mode,
-                "--output",
-                str(result_path),
-            ]
-            for name in (
-                "tensor_parallel_size",
-                "batch_size",
-                "max_num_seqs",
-                "max_model_len",
-                "num_speculative_tokens",
-                "max_tokens",
-                "warmup_iterations",
-                "iterations",
-                "seed",
-            ):
-                command.extend(
-                    (f"--{name.replace('_', '-')}", str(getattr(args, name)))
-                )
-            command.extend(("--dtype", args.dtype))
-            if args.xprofiler:
-                command.append("--xprofiler")
-            if args.verify_gdn_update:
-                command.append("--verify-gdn-update")
-            if args.expect_gdn_reuse:
-                command.append("--expect-gdn-reuse")
-            if args.target_eager:
-                command.append("--target-eager")
+            command = _worker_command(
+                args,
+                result_path,
+                {"async_scheduling": async_mode, "full_graph": graph_mode},
+            )
 
             print(f"\n=== {case_name} ===", flush=True)
             subprocess.run(command, check=True)
@@ -593,11 +798,27 @@ def _run_matrix(args: argparse.Namespace) -> None:
         path.stem: result["token_ids_by_iteration"] == reference_tokens
         for path, result in zip(result_paths, results)
     }
+    deterministic = {
+        path.stem: _tokens_are_deterministic(result)
+        for path, result in zip(result_paths, results)
+    }
+    external_match: dict[str, bool] | None = None
+    if args.reference_dir:
+        external_match = {}
+        reference_dir = Path(args.reference_dir)
+        for path, result in zip(result_paths, results):
+            _assert_external_reference(path.stem, result, reference_dir)
+            external_match[path.stem] = True
     summary = {
         "schema_version": 1,
         "reference_case": result_paths[0].stem,
         "deterministic_tokens_match_reference": token_match,
-        "all_tokens_match": all(token_match.values()),
+        "deterministic_within_case": deterministic,
+        "external_reference_tokens_match": external_match,
+        "all_tokens_match": all(token_match.values()) and all(deterministic.values()),
+        "all_tokens_match_external_reference": (
+            all(external_match.values()) if external_match is not None else None
+        ),
         "cases": {
             path.stem: result["metrics"] for path, result in zip(result_paths, results)
         },
@@ -613,13 +834,191 @@ def _run_matrix(args: argparse.Namespace) -> None:
         )
 
 
+def _precision_scenarios(
+    args: argparse.Namespace,
+) -> tuple[tuple[str, dict[str, Any]], ...]:
+    common = {
+        "warmup_iterations": args.warmup_iterations,
+        "iterations": args.iterations,
+        "num_speculative_tokens": args.num_speculative_tokens,
+        "max_model_len": args.max_model_len,
+        "max_num_batched_tokens": None,
+        "enable_chunked_prefill": False,
+        "prompt_set": "default",
+        "disable_speculative": False,
+        "target_eager": False,
+        "expect_gdn_reuse": args.expect_gdn_reuse,
+        "verify_gdn_update": False,
+        "xprofiler": False,
+    }
+    return (
+        (
+            "regular-b1",
+            common
+            | {
+                "disable_speculative": True,
+                "batch_size": 1,
+                "max_num_seqs": 4,
+                "async_scheduling": "off",
+                "full_graph": "on",
+                "max_tokens": 17,
+                "require_gdn_path": ("prefill", "decode"),
+            },
+        ),
+        (
+            "regular-b3-graph-padding",
+            common
+            | {
+                "disable_speculative": True,
+                "batch_size": 3,
+                "max_num_seqs": 4,
+                "async_scheduling": "off",
+                "full_graph": "on",
+                "max_tokens": 17,
+                "require_gdn_path": ("prefill", "decode", "graph_padding"),
+            },
+        ),
+        (
+            "spec-b1",
+            common
+            | {
+                "batch_size": 1,
+                "max_num_seqs": 4,
+                "async_scheduling": "off",
+                "full_graph": "on",
+                "max_tokens": 17,
+                "require_gdn_path": ("prefill", "pure_spec"),
+            },
+        ),
+        (
+            "spec-b3-graph-padding",
+            common
+            | {
+                "batch_size": 3,
+                "max_num_seqs": 4,
+                "async_scheduling": "off",
+                "full_graph": "on",
+                "max_tokens": 17,
+                "require_gdn_path": ("prefill", "pure_spec", "graph_padding"),
+            },
+        ),
+        (
+            "spec-b4-async",
+            common
+            | {
+                "batch_size": 4,
+                "max_num_seqs": 8,
+                "async_scheduling": "on",
+                "full_graph": "on",
+                "max_tokens": 17,
+                "require_gdn_path": ("prefill", "pure_spec"),
+            },
+        ),
+        (
+            "spec-b2-target-eager",
+            common
+            | {
+                "batch_size": 2,
+                "max_num_seqs": 4,
+                "async_scheduling": "off",
+                "full_graph": "off",
+                "target_eager": True,
+                "max_tokens": 17,
+                "require_gdn_path": ("prefill", "pure_spec"),
+            },
+        ),
+        (
+            "spec-b2-mixed-prefill",
+            common
+            | {
+                "batch_size": 2,
+                "max_num_seqs": 4,
+                "max_model_len": 512,
+                "max_num_batched_tokens": 64,
+                "enable_chunked_prefill": True,
+                "prompt_set": "staggered",
+                "async_scheduling": "off",
+                "full_graph": "on",
+                "max_tokens": 24,
+                "require_gdn_path": ("prefill", "mixed_prefill_spec"),
+            },
+        ),
+    )
+
+
+def _run_precision_suite(args: argparse.Namespace) -> None:
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    reference_dir = Path(args.reference_dir) if args.reference_dir else None
+    summary_cases: dict[str, Any] = {}
+
+    for case_name, overrides in _precision_scenarios(args):
+        result_path = output_dir / f"{case_name}.json"
+        print(f"\n=== precision: {case_name} ===", flush=True)
+        subprocess.run(_worker_command(args, result_path, overrides), check=True)
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        deterministic = _tokens_are_deterministic(result)
+        if not deterministic:
+            raise AssertionError(
+                f"{case_name}: token output differs between iterations"
+            )
+        external_match: bool | None = None
+        if reference_dir is not None:
+            _assert_external_reference(case_name, result, reference_dir)
+            external_match = True
+        summary_cases[case_name] = {
+            "deterministic_within_case": deterministic,
+            "external_reference_tokens_match": external_match,
+            "config": result["config"],
+            "gdn_metadata_paths": result["metrics"]["gdn_metadata_paths"],
+            "gdn_full_builds_per_metadata_call": result["metrics"][
+                "gdn_full_builds_per_metadata_call"
+            ],
+            "gdn_updates_per_metadata_call": result["metrics"][
+                "gdn_updates_per_metadata_call"
+            ],
+        }
+
+    summary = {
+        "schema_version": 1,
+        "external_reference_dir": str(reference_dir) if reference_dir else None,
+        "mamba_cache_mode_varied": False,
+        "all_cases_deterministic": all(
+            case["deterministic_within_case"] for case in summary_cases.values()
+        ),
+        "all_cases_match_external_reference": (
+            all(
+                case["external_reference_tokens_match"]
+                for case in summary_cases.values()
+            )
+            if reference_dir is not None
+            else None
+        ),
+        "cases": summary_cases,
+    }
+    summary_path = output_dir / "precision-summary.json"
+    summary_path.write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    print(f"\nPrecision summary written to {summary_path}")
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target-model", required=True)
     parser.add_argument("--draft-model", required=True)
     parser.add_argument("--output-dir", default="dflash2-gdn-baseline")
+    parser.add_argument(
+        "--reference-dir",
+        help="Directory containing known-good JSON files for exact token comparison",
+    )
     parser.add_argument("--output", help=argparse.SUPPRESS)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--precision-suite",
+        action="store_true",
+        help="Run the expanded cross-scenario correctness suite",
+    )
     parser.add_argument(
         "--async-scheduling", choices=("off", "on", "both"), default="both"
     )
@@ -633,12 +1032,40 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--max-num-seqs", type=int, default=2)
     parser.add_argument("--max-model-len", type=int, default=256)
+    parser.add_argument("--max-num-batched-tokens", type=int)
     parser.add_argument("--num-speculative-tokens", type=int, default=8)
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--warmup-iterations", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--dtype", default="float16")
+    parser.add_argument(
+        "--prompt-set", choices=("default", "staggered"), default="default"
+    )
+    parser.add_argument(
+        "--disable-speculative",
+        action="store_true",
+        help="Run target-only prefill/decode without a speculative model",
+    )
+    parser.add_argument(
+        "--enable-chunked-prefill",
+        action="store_true",
+        help="Enable chunked prefill (used to create mixed prefill/spec batches)",
+    )
+    parser.add_argument(
+        "--require-gdn-path",
+        action="append",
+        default=[],
+        choices=(
+            "prefill",
+            "decode",
+            "pure_spec",
+            "mixed_prefill_spec",
+            "variable_spec",
+            "graph_padding",
+        ),
+        help="Fail unless the measured region executes this GDN metadata path",
+    )
     parser.add_argument(
         "--xprofiler",
         action="store_true",
@@ -663,13 +1090,23 @@ def _parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.verify_gdn_update and args.expect_gdn_reuse:
         parser.error("--verify-gdn-update and --expect-gdn-reuse are exclusive")
+    if args.precision_suite and args.verify_gdn_update:
+        parser.error("--precision-suite does not support --verify-gdn-update")
+    if args.precision_suite and args.xprofiler:
+        parser.error("--precision-suite does not support --xprofiler")
     if args.worker:
         if args.async_scheduling == "both" or args.full_graph == "both":
             parser.error("worker mode requires one async and one graph mode")
         if not args.output:
             parser.error("worker mode requires --output")
-    if args.batch_size < 1 or args.batch_size > len(PROMPTS):
-        parser.error(f"--batch-size must be between 1 and {len(PROMPTS)}")
+    prompt_count = (
+        len(STAGGERED_PROMPTS) if args.prompt_set == "staggered" else len(PROMPTS)
+    )
+    if args.batch_size < 1 or args.batch_size > prompt_count:
+        parser.error(
+            f"--batch-size must be between 1 and {prompt_count} for "
+            f"--prompt-set={args.prompt_set}"
+        )
     return args
 
 
@@ -677,6 +1114,8 @@ def main() -> None:
     args = _parse_args()
     if args.worker:
         _run_worker(args)
+    elif args.precision_suite:
+        _run_precision_suite(args)
     else:
         _run_matrix(args)
 
