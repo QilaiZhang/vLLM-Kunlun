@@ -837,6 +837,12 @@ def _run_matrix(args: argparse.Namespace) -> None:
 def _precision_scenarios(
     args: argparse.Namespace,
 ) -> tuple[tuple[str, dict[str, Any]], ...]:
+    # Historical reference revisions can represent graph padding differently
+    # from the candidate and only need to provide known-good token output.
+    # Enforce current metadata branch coverage on the reuse-enabled candidate.
+    def required_paths(*paths: str) -> tuple[str, ...]:
+        return paths if args.expect_gdn_reuse else ()
+
     common = {
         "warmup_iterations": args.warmup_iterations,
         "iterations": args.iterations,
@@ -862,7 +868,7 @@ def _precision_scenarios(
                 "async_scheduling": "off",
                 "full_graph": "on",
                 "max_tokens": 17,
-                "require_gdn_path": ("prefill", "decode"),
+                "require_gdn_path": required_paths("prefill", "decode"),
             },
         ),
         (
@@ -875,7 +881,9 @@ def _precision_scenarios(
                 "async_scheduling": "off",
                 "full_graph": "on",
                 "max_tokens": 17,
-                "require_gdn_path": ("prefill", "decode", "graph_padding"),
+                "require_gdn_path": required_paths(
+                    "prefill", "decode", "graph_padding"
+                ),
             },
         ),
         (
@@ -887,7 +895,7 @@ def _precision_scenarios(
                 "async_scheduling": "off",
                 "full_graph": "on",
                 "max_tokens": 17,
-                "require_gdn_path": ("prefill", "pure_spec"),
+                "require_gdn_path": required_paths("prefill", "pure_spec"),
             },
         ),
         (
@@ -899,7 +907,9 @@ def _precision_scenarios(
                 "async_scheduling": "off",
                 "full_graph": "on",
                 "max_tokens": 17,
-                "require_gdn_path": ("prefill", "pure_spec", "graph_padding"),
+                "require_gdn_path": required_paths(
+                    "prefill", "pure_spec", "graph_padding"
+                ),
             },
         ),
         (
@@ -911,7 +921,7 @@ def _precision_scenarios(
                 "async_scheduling": "on",
                 "full_graph": "on",
                 "max_tokens": 17,
-                "require_gdn_path": ("prefill", "pure_spec"),
+                "require_gdn_path": required_paths("prefill", "pure_spec"),
             },
         ),
         (
@@ -924,7 +934,7 @@ def _precision_scenarios(
                 "full_graph": "off",
                 "target_eager": True,
                 "max_tokens": 17,
-                "require_gdn_path": ("prefill", "pure_spec"),
+                "require_gdn_path": required_paths("prefill", "pure_spec"),
             },
         ),
         (
@@ -940,7 +950,7 @@ def _precision_scenarios(
                 "async_scheduling": "off",
                 "full_graph": "on",
                 "max_tokens": 24,
-                "require_gdn_path": ("prefill", "mixed_prefill_spec"),
+                "require_gdn_path": required_paths("prefill", "mixed_prefill_spec"),
             },
         ),
     )

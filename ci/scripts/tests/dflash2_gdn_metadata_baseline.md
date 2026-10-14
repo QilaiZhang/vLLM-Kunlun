@@ -146,7 +146,9 @@ export VLLM_KUNLUN_DISABLE_GDN_METADATA_REUSE=1
 
 本轮矩阵不改变或比较 `mamba_cache_mode`。每个 case 除了保存 token IDs，还会记录
 `metrics.gdn_metadata_paths`；如果配置没有实际命中声明的 prefill、decode、pure-spec、
-mixed 或 graph-padding 路径，worker 会直接失败，避免名义覆盖。
+mixed 或 graph-padding 路径，带 `--expect-gdn-reuse` 的 candidate worker 会直接失败，
+避免名义覆盖。历史 reference 只负责提供已知正确 token；由于旧版 metadata 的 padding
+字段形态可能不同，不对它应用当前实现的路径命中断言。
 
 四象限内部一致只能证明不同执行模式彼此一致，不能排除它们共同出错。扩展矩阵应先用
 已知正确的 `c4c2b50` 代码和同一份最新版脚本生成外部基线，再在当前分支逐 token
