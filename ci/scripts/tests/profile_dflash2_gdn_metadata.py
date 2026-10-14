@@ -501,6 +501,10 @@ def _run_worker(args: argparse.Namespace) -> None:
         llm_kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
     if args.enable_chunked_prefill:
         llm_kwargs["enable_chunked_prefill"] = True
+    if args.cudagraph_capture_sizes is not None:
+        llm_kwargs["compilation_config"] = {
+            "cudagraph_capture_sizes": list(args.cudagraph_capture_sizes)
+        }
     llm = LLM(**llm_kwargs)
     sampling_params = SamplingParams(
         temperature=0.0,
@@ -587,6 +591,11 @@ def _run_worker(args: argparse.Namespace) -> None:
             "max_model_len": args.max_model_len,
             "max_num_batched_tokens": args.max_num_batched_tokens,
             "enable_chunked_prefill": args.enable_chunked_prefill,
+            "cudagraph_capture_sizes": (
+                list(args.cudagraph_capture_sizes)
+                if args.cudagraph_capture_sizes is not None
+                else None
+            ),
             "prompt_set": args.prompt_set,
             "num_speculative_tokens": args.num_speculative_tokens,
             "max_tokens": args.max_tokens,
@@ -689,6 +698,13 @@ def _worker_command(
         command.extend(
             ("--max-num-batched-tokens", str(values["max_num_batched_tokens"]))
         )
+    if values.get("cudagraph_capture_sizes") is not None:
+        command.extend(
+            (
+                "--cudagraph-capture-sizes",
+                ",".join(str(size) for size in values["cudagraph_capture_sizes"]),
+            )
+        )
     command.extend(("--dtype", values["dtype"]))
     command.extend(("--prompt-set", values.get("prompt_set", "default")))
     for path in values.get("require_gdn_path", ()):
@@ -735,6 +751,7 @@ def _assert_external_reference(
         "max_model_len",
         "max_num_batched_tokens",
         "enable_chunked_prefill",
+        "cudagraph_capture_sizes",
         "prompt_set",
         "num_speculative_tokens",
         "max_tokens",
@@ -850,6 +867,7 @@ def _precision_scenarios(
         "max_model_len": args.max_model_len,
         "max_num_batched_tokens": None,
         "enable_chunked_prefill": False,
+        "cudagraph_capture_sizes": None,
         "prompt_set": "default",
         "disable_speculative": False,
         "target_eager": False,
@@ -880,6 +898,7 @@ def _precision_scenarios(
                 "max_num_seqs": 4,
                 "async_scheduling": "off",
                 "full_graph": "on",
+                "cudagraph_capture_sizes": (1, 2, 4, 8),
                 "max_tokens": 17,
                 "require_gdn_path": required_paths(
                     "prefill", "decode", "graph_padding"
@@ -906,6 +925,7 @@ def _precision_scenarios(
                 "max_num_seqs": 4,
                 "async_scheduling": "off",
                 "full_graph": "on",
+                "cudagraph_capture_sizes": (1, 2, 4, 8, 16, 32),
                 "max_tokens": 17,
                 "require_gdn_path": required_paths(
                     "prefill", "pure_spec", "graph_padding"
@@ -1043,6 +1063,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-num-seqs", type=int, default=2)
     parser.add_argument("--max-model-len", type=int, default=256)
     parser.add_argument("--max-num-batched-tokens", type=int)
+    parser.add_argument(
+        "--cudagraph-capture-sizes",
+        type=lambda value: tuple(int(size) for size in value.split(",")),
+        help="Comma-separated capture sizes; precision-suite uses this for padding",
+    )
     parser.add_argument("--num-speculative-tokens", type=int, default=8)
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--warmup-iterations", type=int, default=2)
