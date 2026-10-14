@@ -900,9 +900,7 @@ def _precision_scenarios(
                 "full_graph": "on",
                 "cudagraph_capture_sizes": (1, 2, 4, 8),
                 "max_tokens": 17,
-                "require_gdn_path": required_paths(
-                    "prefill", "decode", "graph_padding"
-                ),
+                "require_gdn_path": required_paths("prefill", "decode"),
             },
         ),
         (

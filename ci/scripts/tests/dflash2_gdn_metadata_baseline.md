@@ -137,17 +137,18 @@ export VLLM_KUNLUN_DISABLE_GDN_METADATA_REUSE=1
 | case | 重点覆盖 |
 | --- | --- |
 | `regular-b1` | batch 1 普通 prefill/decode |
-| `regular-b3-graph-padding` | 普通 decode 的 graph padding row |
+| `regular-b3-graph-padding` | 普通多 batch prefill/decode；名称保留以兼容已生成 reference |
 | `spec-b1` | batch 1 prefill 与纯 speculative decode |
 | `spec-b3-graph-padding` | speculative decode 的 graph padding row |
 | `spec-b4-async` | 多 batch + async scheduling + FULL graph |
 | `spec-b2-target-eager` | target eager + drafter 非 FULL graph |
 | `spec-b2-mixed-prefill` | chunked prefill 与 speculative decode 混合 batch |
 
-两个 graph-padding case 会覆盖 vLLM 0.25.1 的 interactivity 默认 capture sizes：测试
-显式指定稀疏尺寸，使普通 decode 的 3 个 token pad 到 4，并使 K=3 speculative
-decode 的 12 个 token pad 到 16。仅设置 batch=3 不够，因为 interactivity 模式默认会
-精确捕获 1～32 的每个尺寸。
+测试显式指定稀疏 capture sizes，以覆盖 vLLM 0.25.1 的 interactivity 默认尺寸。
+target-only 的普通生成在当前部署形态下不会让 GDN metadata 进入 FULL-graph padding
+分支，因此 regular batch=3 只断言普通 prefill/decode；graph-padding 的严格命中由
+K=3 speculative case 负责，其 12 个 token 会选择 16-token capture size。仅设置
+batch=3 不够，因为 interactivity 模式默认会精确捕获 1～32 的每个尺寸。
 
 本轮矩阵不改变或比较 `mamba_cache_mode`。每个 case 除了保存 token IDs，还会记录
 `metrics.gdn_metadata_paths`；如果配置没有实际命中声明的 prefill、decode、pure-spec、
