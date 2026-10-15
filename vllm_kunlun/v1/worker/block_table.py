@@ -10,6 +10,14 @@ relied on ``torch.searchsorted``, which has no Kunlun XPU implementation and
 silently falls back to CPU (host sync + D2H/H2D round trip every step). The
 native op computes the whole mapping on-device in a single launch.
 
+Mamba/GDN state-cache groups skip token slot mapping. On older vLLM versions
+without SlotMappingMode, the V1 runner marks groups from their KV cache specs
+after input buffers are created or rebuilt.
+
+Each active table also owns an immutable device block-size tensor, prepared
+with the input batch and reused across steps. A block-size or device change
+refreshes it; rebuilding the input batch gives the new tables fresh caches.
+
 The existing CPU block-table mirror is also registered by device pointer for
 GDN metadata construction. This lets the GDN builder obtain host state indices
 without reading the device block table back once per attention group.
@@ -19,6 +27,7 @@ once ``vllm.v1.worker.block_table`` is loaded. Idempotent under fork()
 and re-import via the ``_kunlun_slot_patched`` flag on the class.
 """
 
+import functools
 import logging
 from weakref import WeakValueDictionary
 
@@ -53,13 +62,76 @@ def get_cpu_block_table(device_tensor: torch.Tensor) -> torch.Tensor | None:
     return table.get_cpu_tensor()[:rows, :columns]
 
 
+def _get_slot_mapping_block_sizes(table):
+    # Cache only the immutable scalar metadata, never block-table/slot pointers.
+    # Replacing an input/output buffer on the same device does not invalidate it.
+    key = (table.block_size, table.block_table.gpu.device)
+    block_sizes = getattr(table, "_kunlun_slot_mapping_block_sizes", None)
+    if (
+        block_sizes is None
+        or getattr(table, "_kunlun_slot_mapping_block_sizes_key", None) != key
+    ):
+        block_sizes = torch.tensor([key[0]], dtype=torch.int32, device=key[1])
+        table._kunlun_slot_mapping_block_sizes = block_sizes
+        table._kunlun_slot_mapping_block_sizes_key = key
+    return block_sizes
+
+
+def _set_slot_mapping_enabled(runner, kv_cache_config):
+    from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec, MambaSpec
+
+    specs = [
+        group.kv_cache_spec
+        for group in kv_cache_config.kv_cache_groups
+        if not isinstance(group.kv_cache_spec, EncoderOnlyAttentionSpec)
+    ]
+    tables = runner.input_batch.block_table.block_tables
+    if len(specs) != len(tables):
+        raise RuntimeError("KV cache specs and V1 block tables differ in length")
+    for spec, table in zip(specs, tables):
+        layer_specs = list(getattr(spec, "kv_cache_specs", {}).values()) or [spec]
+        table._kunlun_slot_mapping_enabled = not all(
+            isinstance(layer_spec, MambaSpec) for layer_spec in layer_specs
+        )
+        mode = getattr(table, "slot_mapping_mode", None)
+        if (
+            table._kunlun_slot_mapping_enabled
+            and getattr(mode, "value", None) != "none"
+        ):
+            # Prepare before graph capture and the measured steady-state window.
+            _get_slot_mapping_block_sizes(table)
+
+
+def patch_slot_mapping_runner(module):
+    """Configure V1 groups and scalar metadata after buffers are created/rebuilt."""
+    cls = module.GPUModelRunner
+    original = getattr(cls, "may_reinitialize_input_batch", None)
+    if original is None or getattr(
+        original, "_kunlun_slot_mapping_modes_patched", False
+    ):
+        return
+
+    @functools.wraps(original)
+    def may_reinitialize_input_batch(self, kv_cache_config, *args, **kwargs):
+        result = original(self, kv_cache_config, *args, **kwargs)
+        _set_slot_mapping_enabled(self, kv_cache_config)
+        return result
+
+    may_reinitialize_input_batch._kunlun_slot_mapping_modes_patched = True
+    cls.may_reinitialize_input_batch = may_reinitialize_input_batch
+
+
 def _compute_slot_mapping(self, num_reqs, query_start_loc, positions):
+    mode = getattr(self, "slot_mapping_mode", None)
+    if getattr(mode, "value", None) == "none" or not getattr(
+        self, "_kunlun_slot_mapping_enabled", True
+    ):
+        return
     num_tokens = positions.shape[0]
     total_cp_world_size = self.pcp_world_size * self.dcp_world_size
     total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
-    block_sizes = torch.tensor(
-        [self.block_size], dtype=torch.int32, device=self.block_table.gpu.device
-    )
+    # Lazy initialization also supports callers outside GPUModelRunner.
+    block_sizes = _get_slot_mapping_block_sizes(self)
     kunlun_ops.compute_slot_mappings(
         [self.slot_mapping.gpu],  # list
         [self.block_table.gpu],  # list

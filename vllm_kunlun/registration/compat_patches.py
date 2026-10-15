@@ -321,17 +321,25 @@ def _apply_suffix_decoding_patch(module: ModuleType) -> None:
         import vllm_kunlun.v1.sample.spec_decode.suffix_decoding  # noqa: F401
 
 
-# --- worker consumers: re-anchor speculative Mamba state -----------------
+# --- worker consumers: patch V1 Mamba state and slot mapping -------------
 
 
 def _gpu_model_runner_applied(_consumer_module: ModuleType) -> bool:
-    """Return whether GPUModelRunner._prepare_inputs is re-anchor aware."""
+    """Return whether V1 state re-anchoring and slot mapping guards are installed."""
     runner_module = sys.modules.get("vllm.v1.worker.gpu_model_runner")
     cls = getattr(runner_module, "GPUModelRunner", None)
     if cls is None:
         return False
     fn = getattr(cls, "_prepare_inputs", None)
-    return fn is not None and getattr(fn, "_kunlun_spec_reanchor_patched", False)
+    reinitialize = getattr(cls, "may_reinitialize_input_batch", None)
+    return (
+        fn is not None
+        and getattr(fn, "_kunlun_spec_reanchor_patched", False)
+        and (
+            reinitialize is None
+            or getattr(reinitialize, "_kunlun_slot_mapping_modes_patched", False)
+        )
+    )
 
 
 def _apply_gpu_model_runner_patch(_consumer_module: ModuleType) -> None:
@@ -339,9 +347,11 @@ def _apply_gpu_model_runner_patch(_consumer_module: ModuleType) -> None:
     runner_module = sys.modules.get("vllm.v1.worker.gpu_model_runner")
     if runner_module is None or not hasattr(runner_module, "GPUModelRunner"):
         return
+    from vllm_kunlun.v1.worker.block_table import patch_slot_mapping_runner
     from vllm_kunlun.v1.worker.mamba_utils import patch_gpu_model_runner
 
     patch_gpu_model_runner(runner_module)
+    patch_slot_mapping_runner(runner_module)
 
 
 # --- vllm.v1.core.kv_cache_coordinator: Mamba prefix-hit accounting -------

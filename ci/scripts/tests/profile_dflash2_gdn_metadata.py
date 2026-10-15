@@ -5,7 +5,9 @@ The default invocation runs four independent processes covering async
 scheduling on/off and DFlash2 drafter FULL graph on/off.  Each worker warms up
 the engine, resets the counters, then records deterministic generation output,
 end-to-end latency, ``GPUModelRunner._build_attention_metadata`` host time and
-the number/time of full ``GDNAttentionMetadataBuilder.build`` calls.
+the number/time of full ``GDNAttentionMetadataBuilder.build`` calls. Optional
+``--profile-slot-mapping`` hooks also record V1 batch/group/native-entry host
+times and the actual KV cache group layout.
 
 Example:
 
@@ -411,6 +413,20 @@ def _install_timing_hooks(
     return attention_metadata, gdn_build, gdn_update, verifier, path_coverage
 
 
+def _install_slot_mapping_hooks():
+    import kunlun_ops
+    from profile_slot_mappings import SlotMappingProfiler
+    from vllm.v1.kv_cache_interface import MambaSpec
+    from vllm.v1.worker.block_table import BlockTable, MultiGroupBlockTable
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    profiler = SlotMappingProfiler(Timings)
+    profiler.install(
+        GPUModelRunner, BlockTable, MultiGroupBlockTable, kunlun_ops, MambaSpec
+    )
+    return profiler
+
+
 def _maybe_start_xprofiler(enabled: bool) -> Any | None:
     if not enabled:
         return None
@@ -467,6 +483,7 @@ def _run_worker(args: argparse.Namespace) -> None:
         update_verifier,
         path_coverage,
     ) = _install_timing_hooks(args.verify_gdn_update)
+    slot_profiler = _install_slot_mapping_hooks() if args.profile_slot_mapping else None
 
     import torch
     from vllm import LLM, SamplingParams
@@ -515,6 +532,17 @@ def _run_worker(args: argparse.Namespace) -> None:
     for _ in range(args.warmup_iterations):
         llm.generate(prompts, sampling_params, use_tqdm=False)
 
+    environment = None
+    if slot_profiler is not None:
+        from profile_slot_mappings import environment_snapshot
+
+        environment = environment_snapshot(torch)
+        if args.tensor_parallel_size == 1 and not slot_profiler.runtime:
+            raise RuntimeError(
+                "Slot mapping hooks did not observe a V1 runner. Confirm the "
+                "actual runner and use the V1 baseline configuration."
+            )
+
     # Exclude model loading, graph capture and kernel warm-up from steady-state
     # counters.  XProfiler is also narrowed to this measured region.
     attention_metadata.reset()
@@ -524,6 +552,8 @@ def _run_worker(args: argparse.Namespace) -> None:
     if update_verifier is not None:
         update_verifier.reset()
     profiler = _maybe_start_xprofiler(args.xprofiler)
+    if slot_profiler is not None:
+        slot_profiler.start()
     iteration_ms: list[float] = []
     token_ids_by_iteration: list[list[list[int]]] = []
     total_output_tokens = 0
@@ -536,8 +566,17 @@ def _run_worker(args: argparse.Namespace) -> None:
             token_ids_by_iteration.append(token_ids)
             total_output_tokens += sum(len(ids) for ids in token_ids)
     finally:
+        if slot_profiler is not None:
+            slot_profiler.stop()
         _stop_xprofiler(profiler)
 
+    slot_summary = slot_profiler.summary() if slot_profiler is not None else None
+    if (
+        slot_summary is not None
+        and args.tensor_parallel_size == 1
+        and slot_summary["batch"]["calls"] == 0
+    ):
+        raise AssertionError("Measured region did not execute V1 slot mapping")
     if update_verifier is not None and update_verifier.checks == 0:
         raise AssertionError(
             "--verify-gdn-update did not observe a later equivalent GDN group"
@@ -571,11 +610,13 @@ def _run_worker(args: argparse.Namespace) -> None:
                 "GDN metadata reuse expected block-table updates, but none ran"
             )
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "git_revision": _git_revision(),
         "python": sys.version,
         "platform": platform.platform(),
         "torch_version": torch.__version__,
+        "environment": environment,
+        "runtime": slot_profiler.runtime if slot_profiler is not None else None,
         "config": {
             "target_model": args.target_model,
             "draft_model": args.draft_model,
@@ -601,6 +642,7 @@ def _run_worker(args: argparse.Namespace) -> None:
             "max_tokens": args.max_tokens,
             "warmup_iterations": args.warmup_iterations,
             "iterations": args.iterations,
+            "profile_slot_mapping": args.profile_slot_mapping,
             "gdn_metadata_reuse_disabled": os.getenv(
                 "VLLM_KUNLUN_DISABLE_GDN_METADATA_REUSE", "0"
             ).lower()
@@ -615,6 +657,7 @@ def _run_worker(args: argparse.Namespace) -> None:
                 update_verifier.summary() if update_verifier is not None else None
             ),
             "gdn_metadata_paths": path_summary,
+            "slot_mapping": slot_summary,
             "gdn_full_builds_per_metadata_call": (
                 gdn_summary["calls"] / metadata_summary["calls"]
                 if metadata_summary["calls"]
@@ -645,6 +688,14 @@ def _run_worker(args: argparse.Namespace) -> None:
             ),
             "device_metrics": (
                 "Inspect the matching XProfiler trace for D2H/H2D and device gaps."
+            ),
+            "slot_mapping_timing": (
+                "Host wall times without added device synchronization. Batch, "
+                "group and native-entry timings are nested, not additive. The "
+                "native entry includes Python custom-op dispatch and C++ host "
+                "work/waits, not isolated kernel execution. Hooks add overhead; "
+                "compare the same instrumented script across revisions and use "
+                "an uninstrumented run for final end-to-end performance."
             ),
         },
     }
@@ -711,6 +762,7 @@ def _worker_command(
         command.extend(("--require-gdn-path", path))
     for enabled, flag in (
         (values.get("xprofiler"), "--xprofiler"),
+        (values.get("profile_slot_mapping"), "--profile-slot-mapping"),
         (values.get("verify_gdn_update"), "--verify-gdn-update"),
         (values.get("expect_gdn_reuse"), "--expect-gdn-reuse"),
         (values.get("target_eager"), "--target-eager"),
@@ -1100,6 +1152,11 @@ def _parse_args() -> argparse.Namespace:
         help="Fail unless the measured region executes this GDN metadata path",
     )
     parser.add_argument(
+        "--profile-slot-mapping",
+        action="store_true",
+        help="Record V1 slot mapping host times, KV groups and loaded environment",
+    )
+    parser.add_argument(
         "--xprofiler",
         action="store_true",
         help="Call xtorch_ops profiler start/end around measured iterations",
@@ -1121,6 +1178,10 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     args = parser.parse_args()
+    if args.iterations < 1 or args.warmup_iterations < 0:
+        parser.error("iterations must be positive and warmup-iterations non-negative")
+    if args.profile_slot_mapping and args.verify_gdn_update:
+        parser.error("slot mapping baseline cannot include equivalence-check syncs")
     if args.verify_gdn_update and args.expect_gdn_reuse:
         parser.error("--verify-gdn-update and --expect-gdn-reuse are exclusive")
     if args.precision_suite and args.verify_gdn_update:
