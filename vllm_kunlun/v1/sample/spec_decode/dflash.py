@@ -32,36 +32,6 @@ def is_dflash2_draft(speculative_config: Any) -> bool:
     return "DFlash2DraftModel" in (draft_config.architectures or [])
 
 
-def greedy_select_path(
-    candidate_ids: torch.Tensor, scores: torch.Tensor
-) -> torch.Tensor:
-    """Walk the best DFlash2 candidate path from candidate index zero."""
-    if candidate_ids.ndim != 3 or scores.ndim != 4:
-        raise ValueError(
-            "DFlash2 path selection expects candidate_ids [B,L,K] and "
-            f"scores [B,L,K,K], got {candidate_ids.shape} and {scores.shape}."
-        )
-    num_reqs, num_steps, top_k = candidate_ids.shape
-    if scores.shape != (num_reqs, num_steps, top_k, top_k):
-        raise ValueError(
-            f"DFlash2 score shape {scores.shape} does not match "
-            f"candidate shape {candidate_ids.shape}."
-        )
-
-    request_indices = torch.arange(num_reqs, device=candidate_ids.device)
-    predecessor_indices = torch.zeros(
-        num_reqs, dtype=torch.long, device=candidate_ids.device
-    )
-    selected = []
-    for step in range(num_steps):
-        edge_scores = scores[request_indices, step, predecessor_indices]
-        predecessor_indices = edge_scores.argmax(dim=-1)
-        selected.append(candidate_ids[request_indices, step, predecessor_indices])
-    if not selected:
-        return candidate_ids.new_empty((num_reqs, 0))
-    return torch.stack(selected, dim=1)
-
-
 def copy_and_expand_dflash_inputs_native(
     next_token_ids: torch.Tensor,
     target_positions: torch.Tensor,
@@ -477,4 +447,4 @@ class DFlashProposer(UpstreamDFlashProposer):
             hidden,
             anchor_token_ids,
         )
-        return greedy_select_path(candidate_ids, scores).reshape(-1)
+        return kunlun_ops.dflash_greedy_select_path(candidate_ids, scores).reshape(-1)
