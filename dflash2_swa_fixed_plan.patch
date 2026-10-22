@@ -1,0 +1,103 @@
+diff --git a/profile_dflash2_proposal.py b/profile_dflash2_proposal.py
+index 9fca4d3..75c9d42 100644
+--- a/profile_dflash2_proposal.py
++++ b/profile_dflash2_proposal.py
+@@ -576,7 +576,9 @@ class ProposalProfiler:
+                         if wrapper._parameter_guard is not None
+                         else "python"
+                     ),
+-                    "planning_policy": "fixed_max_plus_query_full_attention; geometric_SWA",
++                    "planning_policy": "fixed_full_equivalent; geometric_across_window",
++                    "planning_state": wrapper.planning_state,
++                    "planning_counts": dict(wrapper.planning_counts),
+                     "entry_shapes": [
+                         {
+                             "B": desc.num_reqs,
+diff --git a/v1/sample/spec_decode/dflash.py b/v1/sample/spec_decode/dflash.py
+index c1d988d..ad3563a 100644
+--- a/v1/sample/spec_decode/dflash.py
++++ b/v1/sample/spec_decode/dflash.py
+@@ -679,7 +679,7 @@ class DFlashProposer(UpstreamDFlashProposer):
+                 raise ValueError("DFlash requires a nonempty KV page table")
+             upper = int(new_seq_lens_cpu_upper_bound[:batch_size].max().item())
+             bucket = (
+-                self._dflash_proposal_graph.planning_upper_bound(capacity)
++                self._dflash_proposal_graph.planning_upper_bound(capacity, upper)
+                 if use_proposal_graph
+                 else None
+             )
+diff --git a/v1/sample/spec_decode/dflash_cudagraph.py b/v1/sample/spec_decode/dflash_cudagraph.py
+index e1c4a61..3605a24 100644
+--- a/v1/sample/spec_decode/dflash_cudagraph.py
++++ b/v1/sample/spec_decode/dflash_cudagraph.py
+@@ -772,23 +772,52 @@ class DFlashProposalCUDAGraphWrapper(DFlashDrafterCUDAGraphWrapper):
+         self._model_state_changed = False
+         self.state_checks = self.parameter_snapshots = self.cached_rejections = 0
+         self.capture_attempts = self.post_capture_rejections = 0
++        self.planning_state = None
++        self.planning_counts = {}
+         self.reset_result()
+ 
+-    def planning_upper_bound(self, page_capacity):
++    def planning_upper_bound(self, page_capacity, required_upper=None):
+         # Match main's fixed maximum-length attention planning for FULL graphs.
+         # MRV1 appends Q query positions to the target's CPU upper bound. Keep
+         # that allowance, and never plan beyond the allocated page-table width.
+-        # Kunlun's non-causal SWA has separate page-trimming/window rules, so
+-        # retain its existing geometric buckets until separately validated.
+-        if not self._attention_layers or any(
+-            getattr(layer.impl, "sliding_window", _MISSING_GRAPH_BINDING) is not None
+-            for layer in self._attention_layers
+-        ):
+-            return None
+-        return min(
++        # _resolve_prefill_swa omits a non-causal window when the planning KV
++        # length fits it. Such short-SWA inputs are full-attention-equivalent.
++        # Keep geometric buckets whenever the fixed bound would cross a window.
++        bound = min(
+             self.vllm_config.model_config.max_model_len + self._query_len,
+             page_capacity,
+         )
++        windows = tuple(
++            getattr(layer.impl, "sliding_window", _MISSING_GRAPH_BINDING)
++            for layer in self._attention_layers
++        )
++        reason = None
++        if not windows:
++            reason = "no_attention_layers"
++        elif any(w is not None and not isinstance(w, int) for w in windows):
++            reason = "unknown_window"
++        elif any(w is not None and w < bound for w in windows):
++            reason = "window_below_fixed_bound"
++        elif required_upper is not None and required_upper > bound:
++            reason = "host_upper_exceeds_fixed_bound"
++        selected = "geometric" if reason else "fixed_full_equivalent"
++        reason = reason or (
++            "full_attention"
++            if all(w is None for w in windows)
++            else "window_covers_bound"
++        )
++        self.planning_counts[reason] = self.planning_counts.get(reason, 0) + 1
++        self.planning_state = {
++            "mode": selected,
++            "reason": reason,
++            "fixed_upper_bound": bound,
++            "required_upper_bound": required_upper,
++            "page_capacity": page_capacity,
++            "sliding_windows": [
++                w if w is None or isinstance(w, int) else "unknown" for w in windows
++            ],
++        }
++        return bound if selected == "fixed_full_equivalent" else None
+ 
+     def reset_result(self):
+         self.last_path = "proposal_graph_not_called"
+@@ -826,6 +855,8 @@ class DFlashProposalCUDAGraphWrapper(DFlashDrafterCUDAGraphWrapper):
+         self._model_state_changed = False
+         self.state_checks = self.parameter_snapshots = self.cached_rejections = 0
+         self.capture_attempts = self.post_capture_rejections = 0
++        self.planning_state = None
++        self.planning_counts.clear()
+         self.reset_result()
+ 
+     @staticmethod

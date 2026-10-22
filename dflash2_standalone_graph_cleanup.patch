@@ -1,0 +1,1791 @@
+diff --git a/profile_dflash2_gdn_metadata.py b/profile_dflash2_gdn_metadata.py
+index f0abe23..5270e10 100644
+--- a/profile_dflash2_gdn_metadata.py
++++ b/profile_dflash2_gdn_metadata.py
+@@ -9,14 +9,10 @@ the number/time of full ``GDNAttentionMetadataBuilder.build`` calls. Optional
+ ``--profile-slot-mapping`` hooks also record V1 batch/group/native-entry host
+ times and the actual KV cache group layout. ``--profile-proposal`` adds DFlash2
+ stage host total/self times, actual FULL graph paths, acceptance and memory.
+-``--tail-graph on`` additionally enables the independent M3 sampling-tail graph;
+-``--require-tail-graph-replay`` checks that it actually replayed.
+-``--context-graph on`` enables M4 fixed-capacity context KV capture, independently
+-of the query/tail flags. ``--require-context-graph-replay`` checks its dispatch.
+-``--proposal-graph on`` enables M5 combined context/query/selection capture;
+-``--require-proposal-graph-replay`` requires replay without segmented dispatch.
+-``--verify-dflash-graphs`` adds synchronous private-cache checks and clears the
+-live context/tail graphs between the first two measured generation iterations.
++``--proposal-graph on`` enables combined context/query/selection capture;
++``--require-proposal-graph-replay`` requires replay without query-only dispatch.
++Without a combined hit, context and selection run eagerly while query execution
++follows ``--full-graph``. There are no standalone context/tail graph switches.
+ ``--diagnose-target-diff`` adds synchronous B1/eager logits, greedy rejection
+ and first-layer GDN observations for correctness investigation only.
+ ``--diagnostic-gdn-state-mode shadow/repair`` isolates native GDN base-slot
+@@ -477,12 +473,6 @@ def _run_worker(args: argparse.Namespace) -> None:
+     os.environ["VLLM_KUNLUN_DRAFTER_FULL_CUDAGRAPH"] = (
+         "1" if args.full_graph == "on" else "0"
+     )
+-    os.environ["VLLM_KUNLUN_DFLASH2_TAIL_CUDAGRAPH"] = (
+-        "1" if args.tail_graph == "on" else "0"
+-    )
+-    os.environ["VLLM_KUNLUN_DFLASH2_CONTEXT_CUDAGRAPH"] = (
+-        "1" if args.context_graph == "on" else "0"
+-    )
+     os.environ["VLLM_KUNLUN_DFLASH2_PROPOSAL_CUDAGRAPH"] = (
+         "1" if args.proposal_graph == "on" else "0"
+     )
+@@ -531,13 +521,6 @@ def _run_worker(args: argparse.Namespace) -> None:
+     import torch
+     from vllm import LLM, SamplingParams
+ 
+-    graph_verifier = None
+-    if args.verify_dflash_graphs:
+-        from profile_dflash2_proposal import DFlashGraphVerification
+-
+-        graph_verifier = DFlashGraphVerification(torch)
+-        graph_verifier.install()
+-
+     if not torch.cuda.is_available():
+         raise RuntimeError("Run the worker on a Kunlun CUDA-compatible device")
+ 
+@@ -602,26 +585,6 @@ def _run_worker(args: argparse.Namespace) -> None:
+         )
+     if proposal_profiler is not None and not proposal_profiler.runtime:
+         raise RuntimeError("Proposal hooks did not observe an MRV1 DFlash2 drafter")
+-    if graph_verifier is not None:
+-        try:
+-            with torch.inference_mode():
+-                graph_verifier.run_private_checks()
+-        except Exception as error:
+-            output = Path(args.output)
+-            output.parent.mkdir(parents=True, exist_ok=True)
+-            output.write_text(
+-                json.dumps(
+-                    {
+-                        "environment": environment,
+-                        "graph_verification_error": f"{type(error).__name__}: {error}",
+-                        "completed_checks": graph_verifier.checks,
+-                    },
+-                    indent=2,
+-                ),
+-                encoding="utf-8",
+-            )
+-            graph_verifier.uninstall()
+-            raise
+ 
+     # Exclude model loading, graph capture and kernel warm-up from steady-state
+     # counters.  XProfiler is also narrowed to this measured region.
+@@ -653,8 +616,6 @@ def _run_worker(args: argparse.Namespace) -> None:
+     total_output_tokens = 0
+     try:
+         for iteration in range(args.iterations):
+-            if graph_verifier is not None:
+-                graph_verifier.before_iteration(iteration)
+             if target_diagnostics is not None:
+                 target_diagnostics.start_iteration(iteration)
+             start_ns = time.perf_counter_ns()
+@@ -691,10 +652,6 @@ def _run_worker(args: argparse.Namespace) -> None:
+         proposal_summary["memory"] = memory
+ 
+     slot_summary = slot_profiler.summary() if slot_profiler is not None else None
+-    graph_verification = None
+-    if graph_verifier is not None:
+-        graph_verification = graph_verifier.summary()
+-        graph_verifier.uninstall()
+     if (
+         slot_summary is not None
+         and args.tensor_parallel_size == 1
+@@ -734,7 +691,7 @@ def _run_worker(args: argparse.Namespace) -> None:
+                 "GDN metadata reuse expected block-table updates, but none ran"
+             )
+     result = {
+-        "schema_version": 7,
++        "schema_version": 8,
+         "git_revision": _git_revision(),
+         "python": sys.version,
+         "platform": platform.platform(),
+@@ -751,8 +708,6 @@ def _run_worker(args: argparse.Namespace) -> None:
+             "speculative_enabled": not args.disable_speculative,
+             "async_scheduling": args.async_scheduling == "on",
+             "dflash2_full_graph": args.full_graph == "on",
+-            "dflash2_tail_graph": args.tail_graph == "on",
+-            "dflash2_context_graph": args.context_graph == "on",
+             "dflash2_proposal_graph": args.proposal_graph == "on",
+             "target_eager": args.target_eager,
+             "tensor_parallel_size": args.tensor_parallel_size,
+@@ -778,7 +733,6 @@ def _run_worker(args: argparse.Namespace) -> None:
+             "proposal_device_events": args.proposal_device_events,
+             "diagnose_target_diff": args.diagnose_target_diff,
+             "diagnostic_gdn_state_mode": args.diagnostic_gdn_state_mode,
+-            "verify_dflash_graphs": args.verify_dflash_graphs,
+             "spec_stats_enabled_for_proposal": args.profile_proposal,
+             "gdn_metadata_reuse_disabled": os.getenv(
+                 "VLLM_KUNLUN_DISABLE_GDN_METADATA_REUSE", "0"
+@@ -787,7 +741,6 @@ def _run_worker(args: argparse.Namespace) -> None:
+         },
+         "prompts": prompts,
+         "metrics": {
+-            "graph_verification": graph_verification,
+             "target_diff_diagnostics": (
+                 target_diagnostics.summary(token_ids_by_iteration)
+                 if target_diagnostics is not None
+@@ -826,11 +779,6 @@ def _run_worker(args: argparse.Namespace) -> None:
+         "token_ids_by_iteration": token_ids_by_iteration,
+         "completion_by_iteration": completion_by_iteration,
+         "notes": {
+-            "graph_verification": (
+-                "Correctness-only private cache checks, CPU reads and live context/tail clear; all timings excluded from performance conclusions"
+-                if args.verify_dflash_graphs
+-                else None
+-            ),
+             "target_diff_diagnostics": (
+                 "Correctness-only synchronous CPU reads; wall/stage timings are not performance data"
+                 if args.diagnose_target_diff
+@@ -854,7 +802,7 @@ def _run_worker(args: argparse.Namespace) -> None:
+             ),
+             "proposal_timing": (
+                 "Host total/self use Python boundaries; sample gather includes "
+-                "bookkeeping on the legacy path. Cold context/query/tail capture "
++                "bookkeeping on the eager selection path. Cold query/proposal capture "
+                 "proposals (including warmup) are excluded from "
+                 "stage summaries, but remain in generation wall time and "
+                 "acceptance. Optional events perturb dispatch and measure "
+@@ -870,8 +818,6 @@ def _run_worker(args: argparse.Namespace) -> None:
+     )
+     print(json.dumps(result["metrics"], indent=2))
+     print(f"Baseline written to {output}")
+-    if graph_verification is not None and not graph_verification["all_checks_passed"]:
+-        raise AssertionError(f"DFlash graph verification failed; see {output}")
+     if target_diagnostics is not None:
+         diagnostic = result["metrics"]["target_diff_diagnostics"]
+         if not diagnostic["events"] or diagnostic["gdn_layer"] is None:
+@@ -906,24 +852,6 @@ def _run_worker(args: argparse.Namespace) -> None:
+             and proposal_summary["graph_paths"].get("full_graph_replay", 0) == 0
+         ):
+             raise AssertionError("FULL graph was requested but no draft replay ran")
+-        if args.require_tail_graph_replay and not proposal_summary[
+-            "tail_graph_paths"
+-        ].get("tail_graph_replay", 0):
+-            raise AssertionError(
+-                "Tail graph was requested but no tail replay ran; "
+-                f"tail_graph_paths={proposal_summary['tail_graph_paths']}; "
+-                f"tail_fallback_reasons={proposal_summary['tail_fallback_reasons']}; "
+-                f"runtime={result['runtime']}; diagnostics written to {output}"
+-            )
+-        if args.require_context_graph_replay and not proposal_summary[
+-            "context_graph_paths"
+-        ].get("context_graph_replay", 0):
+-            raise AssertionError(
+-                "Context graph was requested but no context replay ran; "
+-                f"context_graph_paths={proposal_summary['context_graph_paths']}; "
+-                f"context_fallback_reasons={proposal_summary['context_fallback_reasons']}; "
+-                f"runtime={result['runtime']}; diagnostics written to {output}"
+-            )
+ 
+ 
+ def _case_name(async_scheduling: str, full_graph: str) -> str:
+@@ -948,10 +876,6 @@ def _worker_command(
+         values["async_scheduling"],
+         "--full-graph",
+         values["full_graph"],
+-        "--tail-graph",
+-        values["tail_graph"],
+-        "--context-graph",
+-        values["context_graph"],
+         "--proposal-graph",
+         values["proposal_graph"],
+         "--output",
+@@ -995,15 +919,12 @@ def _worker_command(
+         (values.get("profile_slot_mapping"), "--profile-slot-mapping"),
+         (values.get("profile_proposal"), "--profile-proposal"),
+         (values.get("proposal_device_events"), "--proposal-device-events"),
+-        (values.get("require_tail_graph_replay"), "--require-tail-graph-replay"),
+-        (values.get("require_context_graph_replay"), "--require-context-graph-replay"),
+         (values.get("verify_gdn_update"), "--verify-gdn-update"),
+         (values.get("expect_gdn_reuse"), "--expect-gdn-reuse"),
+         (values.get("target_eager"), "--target-eager"),
+         (values.get("disable_speculative"), "--disable-speculative"),
+         (values.get("enable_chunked_prefill"), "--enable-chunked-prefill"),
+         (values.get("diagnose_target_diff"), "--diagnose-target-diff"),
+-        (values.get("verify_dflash_graphs"), "--verify-dflash-graphs"),
+         (
+             values.get("require_proposal_graph_replay"),
+             "--require-proposal-graph-replay",
+@@ -1301,8 +1222,6 @@ def _precision_scenarios(
+         "verify_gdn_update": False,
+         "xprofiler": False,
+         "require_draft_graph_replay": False,
+-        "require_tail_graph_replay": False,
+-        "require_context_graph_replay": False,
+     }
+     return (
+         (
+@@ -1310,8 +1229,6 @@ def _precision_scenarios(
+             common
+             | {
+                 "disable_speculative": True,
+-                "tail_graph": "off",
+-                "context_graph": "off",
+                 "profile_proposal": False,
+                 "proposal_device_events": False,
+                 "batch_size": 1,
+@@ -1327,8 +1244,6 @@ def _precision_scenarios(
+             common
+             | {
+                 "disable_speculative": True,
+-                "tail_graph": "off",
+-                "context_graph": "off",
+                 "profile_proposal": False,
+                 "proposal_device_events": False,
+                 "batch_size": 3,
+@@ -1497,25 +1412,13 @@ def _parse_args() -> argparse.Namespace:
+         "--proposal-graph",
+         choices=("off", "on"),
+         default="off",
+-        help="Enable M5 combined context/query/tail graph; independent flags select fallback paths",
++        help="Enable combined context/query/selection graph; fallback uses eager context/selection and configured query execution",
+     )
+     parser.add_argument(
+         "--require-proposal-graph-replay",
+         action="store_true",
+         help="Require measured combined replay and zero duplicate segmented graph dispatches",
+     )
+-    parser.add_argument(
+-        "--tail-graph",
+-        choices=("off", "on"),
+-        default="off",
+-        help="Enable the independent M3 DFlash2 tail graph (default off)",
+-    )
+-    parser.add_argument(
+-        "--context-graph",
+-        choices=("off", "on"),
+-        default="off",
+-        help="Enable the independent M4 fixed-capacity context KV graph (default off)",
+-    )
+     parser.add_argument(
+         "--target-eager",
+         action="store_true",
+@@ -1579,11 +1482,6 @@ def _parse_args() -> argparse.Namespace:
+         action="store_true",
+         help="Correctness-only B1/eager CPU observations of logits, greedy rejection and GDN state slots",
+     )
+-    parser.add_argument(
+-        "--verify-dflash-graphs",
+-        action="store_true",
+-        help="Correctness-only private context/tail checks and live clear/re-capture; requires proposal profiling, FULL/tail/context on, warmup>=1 and iterations>=2",
+-    )
+     parser.add_argument(
+         "--diagnostic-gdn-state-mode",
+         choices=("observe", "shadow", "repair"),
+@@ -1600,16 +1498,6 @@ def _parse_args() -> argparse.Namespace:
+         action="store_true",
+         help="Fail FULL-on cases without measured draft replay; requires --profile-proposal",
+     )
+-    parser.add_argument(
+-        "--require-tail-graph-replay",
+-        action="store_true",
+-        help="Fail cases without measured tail replay; requires --profile-proposal --tail-graph on",
+-    )
+-    parser.add_argument(
+-        "--require-context-graph-replay",
+-        action="store_true",
+-        help="Fail cases without measured context replay; requires --profile-proposal --context-graph on",
+-    )
+     parser.add_argument(
+         "--xprofiler",
+         action="store_true",
+@@ -1635,12 +1523,11 @@ def _parse_args() -> argparse.Namespace:
+     if args.proposal_graph == "on" and (
+         args.disable_speculative
+         or args.diagnose_target_diff
+-        or args.verify_dflash_graphs
+         or args.precision_suite
+         or args.tensor_parallel_size != 1
+     ):
+         parser.error(
+-            "--proposal-graph on needs a TP1 speculative matrix; exclude diagnostic/precision-suite/verify-dflash-graphs"
++            "--proposal-graph on needs a TP1 speculative matrix; exclude diagnostic/precision-suite"
+         )
+     if args.require_proposal_graph_replay and (
+         args.proposal_graph != "on" or not args.profile_proposal or args.target_eager
+@@ -1648,34 +1535,9 @@ def _parse_args() -> argparse.Namespace:
+         parser.error(
+             "--require-proposal-graph-replay needs --proposal-graph on --profile-proposal without target-eager"
+         )
+-    if args.proposal_graph == "on" and any(
+-        (
+-            args.require_tail_graph_replay,
+-            args.require_context_graph_replay,
+-            args.require_draft_graph_replay,
+-        )
+-    ):
++    if args.proposal_graph == "on" and args.require_draft_graph_replay:
+         parser.error(
+-            "Use --require-proposal-graph-replay for combined dispatch; component replay assertions apply only to segmented runs"
+-        )
+-    if args.verify_dflash_graphs and (
+-        not args.profile_proposal
+-        or args.full_graph != "on"
+-        or args.tail_graph != "on"
+-        or args.context_graph != "on"
+-        or args.target_eager
+-        or args.disable_speculative
+-        or args.diagnose_target_diff
+-        or args.precision_suite
+-        or args.xprofiler
+-        or args.proposal_device_events
+-        or args.profile_slot_mapping
+-        or args.verify_gdn_update
+-        or args.warmup_iterations < 1
+-        or args.iterations < 2
+-    ):
+-        parser.error(
+-            "--verify-dflash-graphs requires FULL/tail/context on, proposal profiling, warmup>=1, iterations>=2; exclude eager/diagnostic/precision-suite/device timing"
++            "Use --require-proposal-graph-replay for combined dispatch; query-only replay assertions apply only without the combined graph"
+         )
+     if args.diagnostic_gdn_state_mode != "observe" and (
+         not args.diagnose_target_diff or args.disable_speculative
+@@ -1689,8 +1551,6 @@ def _parse_args() -> argparse.Namespace:
+         or not args.target_eager
+         or args.async_scheduling != "off"
+         or args.full_graph != "off"
+-        or args.tail_graph != "off"
+-        or args.context_graph != "off"
+         or args.precision_suite
+         or args.xprofiler
+         or args.profile_proposal
+@@ -1701,7 +1561,7 @@ def _parse_args() -> argparse.Namespace:
+         or args.prompt_set != "default"
+     ):
+         parser.error(
+-            "--diagnose-target-diff needs B1/TP1, --target-eager, async/full/tail/context off, "
++            "--diagnose-target-diff needs B1/TP1, --target-eager, async/full off, "
+             "default prompts, max-tokens<=64, iterations<=2; exclude performance profiling/precision-suite"
+         )
+     if args.target_only_reference_dir and (
+@@ -1722,26 +1582,6 @@ def _parse_args() -> argparse.Namespace:
+         parser.error("--profile-proposal requires a DFlash2 speculative model")
+     if args.proposal_device_events and not args.profile_proposal:
+         parser.error("--proposal-device-events requires --profile-proposal")
+-    if args.require_tail_graph_replay and (
+-        not args.profile_proposal
+-        or args.tail_graph != "on"
+-        or args.target_eager
+-        or args.precision_suite
+-    ):
+-        parser.error(
+-            "--require-tail-graph-replay needs --profile-proposal --tail-graph on "
+-            "without target-eager or precision-suite"
+-        )
+-    if args.require_context_graph_replay and (
+-        not args.profile_proposal
+-        or args.context_graph != "on"
+-        or args.target_eager
+-        or args.precision_suite
+-    ):
+-        parser.error(
+-            "--require-context-graph-replay needs --profile-proposal --context-graph on "
+-            "without target-eager or precision-suite"
+-        )
+     if args.require_draft_graph_replay:
+         if not args.profile_proposal:
+             parser.error("--require-draft-graph-replay requires --profile-proposal")
+diff --git a/profile_dflash2_proposal.py b/profile_dflash2_proposal.py
+index ac01b33..b5dd400 100644
+--- a/profile_dflash2_proposal.py
++++ b/profile_dflash2_proposal.py
+@@ -104,11 +104,6 @@ class ProposalProfiler:
+         self.outside_propose: dict[str, dict[str, Any]] = {}
+         self.graph_paths: Counter[str] = Counter()
+         self.fallback_reasons: Counter[str] = Counter()
+-        self.tail_graph_paths: Counter[str] = Counter()
+-        self.tail_fallback_reasons: Counter[str] = Counter()
+-        self.context_graph_paths: Counter[str] = Counter()
+-        self.context_fallback_reasons: Counter[str] = Counter()
+-        self.context_rows: Counter[str] = Counter()
+         self.proposal_graph_paths: Counter[str] = Counter()
+         self.proposal_fallback_reasons: Counter[str] = Counter()
+         self.proposal_rows: Counter[str] = Counter()
+@@ -209,8 +204,6 @@ class ProposalProfiler:
+             if proposal is not None:
+                 if name == "draft_token_selection":
+                     self._gather_gap(proposal, "sample_gather_and_bookkeeping")
+-                elif name == "tail_dispatch":
+-                    self._gather_gap(proposal, "query_to_tail_bookkeeping")
+             with self.stage(name):
+                 return method(*args, **kwargs)
+ 
+@@ -240,12 +233,6 @@ class ProposalProfiler:
+                         self.errors += 1
+                 raise
+             else:
+-                tail = getattr(drafter, "_dflash_tail_graph", None)
+-                tail_path = tail.last_path if tail is not None else "tail_disabled"
+-                context = getattr(drafter, "_dflash_context_graph", None)
+-                context_path = (
+-                    context.last_path if context is not None else "context_disabled"
+-                )
+                 combined = getattr(drafter, "_dflash_proposal_graph", None)
+                 combined_path = (
+                     combined.last_path if combined is not None else "proposal_disabled"
+@@ -259,20 +246,12 @@ class ProposalProfiler:
+                     "proposal_graph_replay",
+                 )
+                 if combined_hit:
+-                    if (
+-                        proposal.graph_path != "without_full_graph_wrapper"
+-                        or tail_path not in ("tail_disabled", "tail_not_called")
+-                        or context_path
+-                        not in ("context_disabled", "context_not_called")
+-                    ):
++                    if proposal.graph_path != "without_full_graph_wrapper":
+                         self.duplicate_segment_dispatches += 1
+                     proposal.graph_path = combined_path
+                     proposal.fallback_reason = None
+-                if (
+-                    tail_path == "tail_graph_capture"
+-                    or context_path == "context_graph_capture"
+-                    or combined_path == "proposal_graph_capture"
+-                    or (combined is not None and combined.last_capture_attempted)
++                if combined_path == "proposal_graph_capture" or (
++                    combined is not None and combined.last_capture_attempted
+                 ):
+                     proposal.capture = True
+                 with self._lock:
+@@ -282,10 +261,6 @@ class ProposalProfiler:
+                     self.graph_paths[proposal.graph_path] += 1
+                     if proposal.fallback_reason:
+                         self.fallback_reasons[proposal.fallback_reason] += 1
+-                    self.tail_graph_paths[tail_path] += 1
+-                    if tail is not None and tail.last_fallback_reason:
+-                        self.tail_fallback_reasons[tail.last_fallback_reason] += 1
+-                    self.context_graph_paths[context_path] += 1
+                     self.proposal_graph_paths[combined_path] += 1
+                     if combined is not None:
+                         if combined.last_fallback_reason:
+@@ -301,20 +276,6 @@ class ProposalProfiler:
+                             self.proposal_rows["graph_input"] += min(count, capacity)
+                             self.proposal_rows["padding"] += max(0, capacity - count)
+                             self.proposal_rows["overflow"] += combined.last_overflow
+-                    if context is not None:
+-                        if context.last_fallback_reason:
+-                            self.context_fallback_reasons[
+-                                context.last_fallback_reason
+-                            ] += 1
+-                        count = context.last_num_context
+-                        capacity = context.last_capacity
+-                        self.context_rows["input"] += count
+-                        if capacity:
+-                            self.context_rows["graph_input"] += min(count, capacity)
+-                            self.context_rows["padding"] += max(0, capacity - count)
+-                            self.context_rows["overflow"] += context.last_overflow
+-                        else:
+-                            self.context_rows["eager"] += count
+                     if proposal.capture:
+                         self.capture_proposals.add(proposal.spans[-1].elapsed_ns)
+                     else:
+@@ -444,16 +405,9 @@ class ProposalProfiler:
+         def load(drafter, *args, **kwargs):
+             result = original_load(drafter, *args, **kwargs)
+             if drafter.is_dflash2:
+-                tail = drafter._dflash_tail_graph
+-                context = drafter._dflash_context_graph
+                 combined = drafter._dflash_proposal_graph
+                 if combined is not None:
+                     self._proposal_wrappers.append(combined)
+-                limit_source = None
+-                if tail is not None:
+-                    limit_source = (
+-                        "auto" if tail._max_entries_override is None else "explicit"
+-                    )
+                 self.runtime.append(
+                     {
+                         "proposer_class": f"{type(drafter).__module__}.{type(drafter).__name__}",
+@@ -469,25 +423,7 @@ class ProposalProfiler:
+                         "full_graph_wrapper": isinstance(
+                             drafter.model, graph_module.DFlashDrafterCUDAGraphWrapper
+                         ),
+-                        "tail_graph_wrapper": tail is not None,
+-                        "tail_graph_max_entries": (
+-                            tail._max_entries if tail is not None else None
+-                        ),
+-                        "tail_graph_limit_source": limit_source,
+-                        "context_graph_wrapper": context is not None,
+-                        "context_graph_max_entries": (
+-                            context._max_entries if context is not None else None
+-                        ),
+-                        "context_graph_limit_source": (
+-                            (
+-                                "auto"
+-                                if context._max_entries_override is None
+-                                else "explicit"
+-                            )
+-                            if context is not None
+-                            else None
+-                        ),
+-                        "context_graph_capacity": "min(B * (K + 1), max_num_tokens)",
++                        "graph_architecture": "proposal_or_eager_context_tail",
+                         "proposal_graph_wrapper": combined is not None,
+                         "proposal_graph_max_entries": (
+                             combined.max_entries if combined is not None else None
+@@ -563,31 +499,12 @@ class ProposalProfiler:
+         self._patch(graph_module, "_graph_signature", signature)
+         self._patch(base_graph_cls, "__call__", base_call)
+         self._patch(wrapper_cls, "__call__", graph_call)
+-        tail_cls = graph_module.DFlashTailCUDAGraphWrapper
+-        for name, stage in (
+-            ("__call__", "tail_dispatch"),
+-            ("stage_inputs", "tail_staging"),
+-        ):
+-            self._patch(tail_cls, name, self.wrap_stage(stage, getattr(tail_cls, name)))
+-        # Preserve the staticmethod descriptor on uninstall.
+-        self._patch(
+-            tail_cls,
+-            "copy_output",
+-            staticmethod(self.wrap_stage("tail_output_copy", tail_cls.copy_output)),
+-        )
+-        context_cls = graph_module.DFlashContextCUDAGraphWrapper
+-        for name, stage in (
+-            ("__call__", "context_precompute"),
+-            ("stage_inputs", "context_staging"),
+-            ("run_overflow", "context_overflow"),
+-        ):
+-            self._patch(
+-                context_cls, name, self.wrap_stage(stage, getattr(context_cls, name))
+-            )
+         self._patch(
+             model_cls,
+             "context_kv_graph_state",
+-            self.wrap_stage("context_graph_state", model_cls.context_kv_graph_state),
++            self.wrap_stage(
++                "proposal_context_state_snapshot", model_cls.context_kv_graph_state
++            ),
+         )
+         proposal_cls = graph_module.DFlashProposalCUDAGraphWrapper
+         for name, stage in (
+@@ -637,11 +554,6 @@ class ProposalProfiler:
+             },
+             "graph_paths": dict(self.graph_paths),
+             "fallback_reasons": dict(self.fallback_reasons),
+-            "tail_graph_paths": dict(self.tail_graph_paths),
+-            "tail_fallback_reasons": dict(self.tail_fallback_reasons),
+-            "context_graph_paths": dict(self.context_graph_paths),
+-            "context_fallback_reasons": dict(self.context_fallback_reasons),
+-            "context_rows": dict(self.context_rows),
+             "proposal_graph_paths": dict(self.proposal_graph_paths),
+             "proposal_fallback_reasons": dict(self.proposal_fallback_reasons),
+             "proposal_rows": dict(self.proposal_rows),
+@@ -742,16 +654,14 @@ class ProposalProfiler:
+             "timing_semantics": {
+                 "host": "wall time; self subtracts observed nested spans only; stages are not additive",
+                 "device": "optional current-stream event elapsed time, not kernel-only time; nested and not additive",
+-                "gather": "legacy path: query-return to selection includes gather/bookkeeping; tail path: query_to_tail_bookkeeping excludes gather captured inside tail_dispatch",
+-                "capture": "entire proposals that capture a context, query, tail or combined proposal graph (including warmup) are excluded from stage timings; generation wall time/acceptance still include them",
+-                "context": "context_precompute includes state/address checks, staging, optional eager overflow and replay/fallback; padding rows use PAD slots; inner Python precompute is skipped during replay",
+-                "context_rows": "input = graph_input + overflow + eager; graph_input counts source rows, including any rejected/PAD slots; padding counts extra inert capacity rows; includes cold proposals",
+-                "tail": "tail_dispatch includes staging, graph replay or eager fallback, and output clone; inner selection stages run only in eager/warmup/capture, not on replay",
+-                "graph_evidence": "graph_paths/context_graph_paths/tail_graph_paths/proposal_graph_paths record software wrapper/API dispatch; they do not prove native device graph launches or backend capture coverage; validate with runtime trace",
+-                "scope": "MRV1 DFlash2 independent graphs or M5 combined context/query/tail graph; combined replay bypasses component Python calls",
+-                "proposal_graph": "proposal_graph_dispatch includes state/budget checks, staging, overflow, replay and independent output clone; all capture attempts, including captures rejected by the budget, exclude the whole proposal from stage timings; duplicate_segment_dispatches counts combined hits that also dispatched an old graph wrapper; cache/state counters include warmup and reset on clear",
++                "gather": "eager selection: query-return to selection includes gather/bookkeeping; combined replay bypasses Python gather/selection",
++                "capture": "entire proposals that capture a query or combined proposal graph (including warmup) are excluded from stage timings; generation wall time/acceptance still include them",
++                "context": "context_precompute measures eager model precompute; combined replay bypasses it, and proposal_graph_overflow measures extra rows outside the fixed-capacity graph",
++                "graph_evidence": "graph_paths/proposal_graph_paths record software wrapper/API dispatch; they do not prove native device graph launches or backend capture coverage; validate with runtime trace",
++                "scope": "MRV1 DFlash2 combined context/query/selection graph or eager context/selection with configured query execution; no standalone context/tail graphs",
++                "proposal_graph": "proposal_graph_dispatch includes state/budget checks, staging, overflow, replay and independent output clone; all capture attempts, including captures rejected by the budget, exclude the whole proposal from stage timings; duplicate_segment_dispatches counts combined hits that also dispatched the query-only graph wrapper; cache/state counters include warmup and reset on clear",
+                 "proposal_dispatch_breakdown": "descriptor and host_plan_check keep full validation; offloader_sync precedes graph_submit; graph_submit is the replay API call, not device kernel duration; output_copy retains independent storage; attention_graph_signature covers both combined and legacy query paths; added nested stages change dispatch self accounting",
+-                "context_state_guard": "every cache hit checks live context bindings/addresses/layout/scalars after parameter checks; context_graph_state runs on initialization or guard miss; cached counters include warmup; replay source is collected only in summary",
++                "context_state_guard": "every cache hit checks live context bindings/addresses/layout/scalars after parameter checks; proposal_context_state_snapshot runs on initialization or guard miss; cached counters include warmup; replay source is collected only in summary",
+                 "parameter_layout_guard": "torch_root_tensor_match checks parameter layout inside the binding/address guard tree; other backends retain the original separate layout checker; a failed guard is confirmed with the full original checks",
+                 "slow_proposals": "up to 3 slowest successful non-capture proposals, with all existing spans from the same call; ordinal includes successful cold proposals since start(); inclusive nested spans are not additive; serialization runs in summary without new device synchronization",
+             },
+@@ -792,369 +702,6 @@ def install_proposal_profiler(timings_factory: Callable, device_events: bool):
+     return profiler
+ 
+ 
+-class DFlashGraphVerification:
+-    """Opt-in synchronous M4 checks; never use these runs for performance.
+-
+-    Direct context checks swap in small private BHLD caches at a quiescent
+-    boundary. Live model caches are restored before generation resumes. Tail
+-    checks use private wrappers, then retain real returned tensors across live
+-    replay and an explicit context/tail clear between generation iterations.
+-    """
+-
+-    _patch = ProposalProfiler._patch
+-
+-    def __init__(self, torch):
+-        self.torch = torch
+-        self._patches = []
+-        self.drafter = None
+-        self.active = False
+-        self.probing = False
+-        self.phase = "before_clear"
+-        self.checks = []
+-        self.paths = Counter()
+-        self.batches = {"context": set(), "tail": set()}
+-        self.held_outputs = {}
+-
+-    def check(self, name, passed, **details):
+-        self.checks.append({"name": name, "passed": bool(passed), **details})
+-
+-    def install(self):
+-        from vllm_kunlun.v1.sample.spec_decode import dflash_cudagraph as graphs
+-        from vllm_kunlun.v1.sample.spec_decode.dflash import DFlashProposer
+-
+-        original_load = DFlashProposer.load_model
+-
+-        @functools.wraps(original_load)
+-        def load(drafter, *args, **kwargs):
+-            result = original_load(drafter, *args, **kwargs)
+-            if drafter.is_dflash2:
+-                self.drafter = drafter
+-            return result
+-
+-        self._patch(DFlashProposer, "load_model", load)
+-        for kind, cls in (
+-            ("context", graphs.DFlashContextCUDAGraphWrapper),
+-            ("tail", graphs.DFlashTailCUDAGraphWrapper),
+-        ):
+-            self._patch(cls, "__call__", self._wrap_call(kind, cls.__call__))
+-
+-    def _wrap_call(self, kind, method):
+-        @functools.wraps(method)
+-        def call(wrapper, *args, **kwargs):
+-            result = method(wrapper, *args, **kwargs)
+-            if self.active and not self.probing:
+-                self.paths[self.phase, kind, wrapper.last_path] += 1
+-                if kind == "tail":
+-                    # The V1 tail currently returns flattened [B * K] IDs.
+-                    batch = result.numel() // (wrapper._query_len - 1)
+-                    self.batches[kind].add(batch)
+-                    if batch not in self.held_outputs:
+-                        self.held_outputs[batch] = (result, result.cpu().clone())
+-                else:
+-                    self.batches[kind].add(
+-                        kwargs["num_reqs"] if "num_reqs" in kwargs else args[3]
+-                    )
+-            return result
+-
+-        return call
+-
+-    def verify_held_outputs(self, boundary):
+-        for batch, (output, expected) in self.held_outputs.items():
+-            self.check(
+-                f"live_tail_output_survives_{boundary}_B{batch}",
+-                self.torch.equal(output.cpu(), expected),
+-            )
+-
+-    def run_private_checks(self):
+-        from vllm_kunlun.v1.sample.spec_decode import dflash_cudagraph as graphs
+-
+-        if self.drafter is None:
+-            raise RuntimeError("DFlash2 verification did not observe a drafter")
+-        context = self.drafter._dflash_context_graph
+-        tail = self.drafter._dflash_tail_graph
+-        if context is None or tail is None or not tail._inputs:
+-            raise RuntimeError("Verification requires warmed context/tail wrappers")
+-        self.torch.cuda.synchronize()
+-        self.probing = True
+-        try:
+-            self._verify_context(graphs, context)
+-            self._verify_tail(graphs, tail)
+-        finally:
+-            self.probing = False
+-        self.active = True
+-
+-    def _verify_context(self, graphs, context):
+-        torch = self.torch
+-        model = context._graph_state.__self__.model
+-        layers = model._attn_layers
+-        live_caches = [layer.kv_cache for layer in layers]
+-        capacity = context._query_len
+-        private = None
+-        original_capture = graphs._capture_dflash_graph
+-        sentinel = 0.125
+-
+-        def capture(wrapper, *args):
+-            entry = original_capture(wrapper, *args)
+-            if wrapper is private:
+-                self.check(
+-                    "context_warmup_capture_all_PAD_inert",
+-                    all(bool((cache == sentinel).all()) for cache in caches),
+-                )
+-            return entry
+-
+-        caches = []
+-        try:
+-            for layer, live in zip(layers, live_caches):
+-                if live.ndim != 5 or live.shape[0] != 2:
+-                    raise ValueError("Context verification requires Kunlun BHLD cache")
+-                # Include untouched guard slots. No live cache contents are
+-                # copied, read back, or modified by the probe.
+-                blocks = (2 * capacity + 2) // live.shape[3] + 1
+-                cache = live.new_full((2, blocks, *live.shape[2:]), sentinel)
+-                caches.append(cache)
+-                layer.kv_cache = cache
+-            private = graphs.DFlashContextCUDAGraphWrapper(
+-                context._precompute_context_kv,
+-                context._graph_state,
+-                context.vllm_config,
+-                context._device,
+-                context._query_len,
+-                max_entries=2,
+-            )
+-            graphs._capture_dflash_graph = capture
+-            seed = self.drafter._dflash_hidden_states[:1].clone()
+-            # Alternate two descriptors with changing values/count/slots.
+-            scenarios = (
+-                ("padding_capture", capacity - 1, 1.0, False, 1),
+-                ("equal_replay", capacity, 0.5, False, 1),
+-                ("overflow_replay", capacity + 1, 0.75, False, 1),
+-                ("second_entry_capture", 2 * capacity - 1, 1.0, False, 2),
+-                ("padding_replay", capacity - 1, 0.25, False, 1),
+-                ("second_entry_replay", 2 * capacity - 1, 0.5, False, 2),
+-                ("padding_recapture", capacity - 1, 1.0, True, 1),
+-                ("after_recapture_replay", capacity - 1, 0.5, False, 1),
+-            )
+-            for name, count, factor, clear, batch in scenarios:
+-                graph_capacity = batch * capacity
+-                if clear:
+-                    torch.cuda.synchronize()
+-                    self.check("private_context_two_entries", len(private._inputs) == 2)
+-                    private.clear_graphs()
+-                    self.check("private_context_clear", self._is_clear(private))
+-                hidden = seed.repeat(count, 1) * factor
+-                positions = torch.arange(count, device=seed.device, dtype=torch.int64)
+-                # Skip the first and last slot; cross a block boundary when the
+-                # capacity permits. Reverse slots to expose stale staging.
+-                slots = torch.arange(1, count + 1, device=seed.device).flip(0)
+-                for cache in caches:
+-                    cache.fill_(sentinel)
+-                context.runnable(hidden, positions, slots)
+-                expected = [cache.clone() for cache in caches]
+-                for cache in caches:
+-                    cache.fill_(sentinel)
+-                private(
+-                    hidden, positions, slots, num_reqs=batch, capacity=graph_capacity
+-                )
+-                max_abs = max(
+-                    float((actual.float() - ref.float()).abs().max())
+-                    for actual, ref in zip(caches, expected)
+-                )
+-                tolerance = 2 * max(
+-                    torch.finfo(seed.dtype).eps, torch.finfo(caches[0].dtype).eps
+-                )
+-                close = all(
+-                    torch.allclose(actual, ref, rtol=tolerance, atol=tolerance)
+-                    for actual, ref in zip(caches, expected)
+-                )
+-                guards = []
+-                for actual in caches:
+-                    # Flatten only block/token dimensions in the documented
+-                    # BHLD layout. Check every untouched slot exactly.
+-                    rows = actual.permute(0, 1, 3, 2, 4).flatten(1, 2)
+-                    guards.append(bool((rows[:, :1] == sentinel).all()))
+-                    guards.append(bool((rows[:, count + 1 :] == sentinel).all()))
+-                expected_path = (
+-                    "context_graph_capture"
+-                    if name
+-                    in ("padding_capture", "padding_recapture", "second_entry_capture")
+-                    else "context_graph_replay"
+-                )
+-                self.check(
+-                    "context_" + name,
+-                    close and all(guards) and private.last_path == expected_path,
+-                    count=count,
+-                    batch=batch,
+-                    capacity=graph_capacity,
+-                    padding=max(0, graph_capacity - count),
+-                    overflow=max(0, count - graph_capacity),
+-                    max_abs=max_abs,
+-                    rtol=tolerance,
+-                    atol=tolerance,
+-                    input_dtype=str(seed.dtype),
+-                    cache_dtype=str(caches[0].dtype),
+-                    untouched_slots_exact=all(guards),
+-                    path=private.last_path,
+-                )
+-            # A captured cache address must never be reused after replacement.
+-            # Exercise the real fallback while both cache sets are private.
+-            replacement = [torch.full_like(cache, sentinel) for cache in caches]
+-            for layer, cache, old in zip(layers, replacement, caches):
+-                layer.kv_cache = cache
+-                old.fill_(sentinel)
+-            context.runnable(hidden, positions, slots)
+-            expected = [cache.clone() for cache in replacement]
+-            for cache in replacement:
+-                cache.fill_(sentinel)
+-            print(
+-                "M4 private-cache verification: intentionally changed cache addresses; "
+-                "expect one model_state_changed fallback",
+-                flush=True,
+-            )
+-            private(hidden, positions, slots, num_reqs=1, capacity=capacity)
+-            self.check(
+-                "context_cache_address_change_falls_back_without_old_cache_write",
+-                private.last_fallback_reason == "model_state_changed"
+-                and private.last_path == "context_graph_fallback"
+-                and all(
+-                    torch.allclose(actual, ref, rtol=tolerance, atol=tolerance)
+-                    for actual, ref in zip(replacement, expected)
+-                )
+-                and all(bool((cache == sentinel).all()) for cache in caches),
+-                reason=private.last_fallback_reason,
+-            )
+-        finally:
+-            try:
+-                torch.cuda.synchronize()
+-            finally:
+-                graphs._capture_dflash_graph = original_capture
+-                try:
+-                    if private is not None:
+-                        private.clear_graphs()
+-                finally:
+-                    for layer, cache in zip(layers, live_caches):
+-                        layer.kv_cache = cache
+-
+-    def _verify_tail(self, graphs, tail):
+-        from vllm.config import CUDAGraphMode
+-        from vllm.forward_context import get_forward_context, set_forward_context
+-
+-        torch = self.torch
+-        seed = next(iter(tail._inputs.values()))
+-        query_len = tail._query_len
+-        private = graphs.DFlashTailCUDAGraphWrapper(
+-            tail.runnable, tail.vllm_config, tail._device, query_len, max_entries=2
+-        )
+-        held = []
+-        try:
+-            for index, batch in enumerate((1, 2, 1, 2, 1, 1)):
+-                if index == 4:
+-                    torch.cuda.synchronize()
+-                    self.check("private_tail_two_entries", len(private._inputs) == 2)
+-                    private.clear_graphs()
+-                    self.check("private_tail_clear", self._is_clear(private))
+-                hidden = seed.hidden_states[:query_len].repeat(batch, 1).clone()
+-                hidden *= 1.0 - index * 0.1
+-                ids = seed.input_ids[:query_len].repeat(batch).clone()
+-                ids.view(batch, query_len)[:, 0].fill_(index % 2)
+-                samples = (
+-                    torch.arange(
+-                        batch * query_len,
+-                        device=ids.device,
+-                        dtype=seed.sample_indices.dtype,
+-                    )
+-                    .view(batch, query_len)[:, 1:]
+-                    .reshape(-1)
+-                )
+-                with set_forward_context(
+-                    None,
+-                    tail.vllm_config,
+-                    num_tokens=batch * query_len,
+-                    cudagraph_runtime_mode=CUDAGraphMode.FULL,
+-                ):
+-                    get_forward_context().skip_compiled = True
+-                    expected = tail.runnable(hidden, samples, ids).cpu().clone()
+-                output = private(hidden, samples, ids)
+-                expected_path = (
+-                    "tail_graph_capture" if index in (0, 1, 4) else "tail_graph_replay"
+-                )
+-                self.check(
+-                    f"tail_eager_equivalent_{index}_B{batch}",
+-                    torch.equal(output.cpu(), expected)
+-                    and private.last_path == expected_path,
+-                    path=private.last_path,
+-                )
+-                held.append((output, expected))
+-            self.check(
+-                "private_tail_outputs_survive_entries_replay_clear",
+-                all(torch.equal(output.cpu(), ref) for output, ref in held),
+-            )
+-        finally:
+-            torch.cuda.synchronize()
+-            private.clear_graphs()
+-
+-    @staticmethod
+-    def _is_clear(wrapper):
+-        return (
+-            not wrapper._inputs
+-            and not wrapper.concrete_cudagraph_entries
+-            and wrapper._stream_id is None
+-        )
+-
+-    def before_iteration(self, iteration):
+-        if iteration != 1:
+-            return
+-        self.torch.cuda.synchronize()
+-        self.verify_held_outputs("before_clear")
+-        for kind in ("context", "tail"):
+-            wrapper = getattr(self.drafter, f"_dflash_{kind}_graph")
+-            wrapper.clear_graphs()
+-            self.check("live_" + kind + "_clear", self._is_clear(wrapper))
+-        self.phase = "after_clear"
+-
+-    def summary(self):
+-        self.torch.cuda.synchronize()
+-        self.verify_held_outputs("after_recapture")
+-        self.active = False
+-        for kind in ("context", "tail"):
+-            for suffix in ("capture", "replay"):
+-                self.check(
+-                    f"live_{kind}_{suffix}_after_clear",
+-                    self.paths["after_clear", kind, f"{kind}_graph_{suffix}"] > 0,
+-                )
+-        self.check("live_tail_outputs_observed", bool(self.held_outputs))
+-        self.check(
+-            "live_no_unexpected_fallback",
+-            all(
+-                path in (f"{kind}_graph_capture", f"{kind}_graph_replay")
+-                for _, kind, path in self.paths
+-            ),
+-        )
+-        return {
+-            "not_for_performance": True,
+-            "all_checks_passed": bool(self.checks)
+-            and all(item["passed"] for item in self.checks),
+-            "checks": self.checks,
+-            "live_paths": [
+-                {"phase": phase, "kind": kind, "path": path, "calls": count}
+-                for (phase, kind, path), count in sorted(self.paths.items())
+-            ],
+-            "retained_live_output_batches": sorted(self.held_outputs),
+-            "live_batches": {
+-                kind: sorted(batches) for kind, batches in self.batches.items()
+-            },
+-            "scope": "Private synthetic context padding/equal/overflow and context/tail B1/B2 entries; live independent context/tail clear and output retention; query graphs are not cleared",
+-        }
+-
+-    def uninstall(self):
+-        self.active = False
+-        for owner, name, own, original in reversed(self._patches):
+-            if own:
+-                setattr(owner, name, original)
+-            else:
+-                delattr(owner, name)
+-        self._patches.clear()
+-
+-
+ class TargetDiffDiagnostics:
+     """Synchronous B1/eager observations for the target/spec precision investigation.
+ 
+diff --git a/profile_slot_mappings.py b/profile_slot_mappings.py
+index 690f753..82e8200 100644
+--- a/profile_slot_mappings.py
++++ b/profile_slot_mappings.py
+@@ -163,10 +163,6 @@ def environment_snapshot(torch: Any) -> dict[str, Any]:
+                 "VLLM_KUNLUN_DFLASH2_PROPOSAL_CUDAGRAPH",
+                 "VLLM_KUNLUN_DFLASH2_PROPOSAL_CUDAGRAPH_MAX_ENTRIES",
+                 "VLLM_KUNLUN_DFLASH2_PROPOSAL_CUDAGRAPH_MAX_BYTES",
+-                "VLLM_KUNLUN_DFLASH2_TAIL_CUDAGRAPH",
+-                "VLLM_KUNLUN_DFLASH2_TAIL_CUDAGRAPH_MAX_ENTRIES",
+-                "VLLM_KUNLUN_DFLASH2_CONTEXT_CUDAGRAPH",
+-                "VLLM_KUNLUN_DFLASH2_CONTEXT_CUDAGRAPH_MAX_ENTRIES",
+                 "VLLM_KUNLUN_DISABLE_GDN_METADATA_REUSE",
+                 "XMLIR_FORCE_USE_XPU_GRAPH",
+                 "XMLIR_ENABLE_MOCK_TORCH_COMPILE",
+diff --git a/models/qwen3_dflash2.py b/models/qwen3_dflash2.py
+index c859872..835f7be 100644
+--- a/models/qwen3_dflash2.py
++++ b/models/qwen3_dflash2.py
+@@ -778,7 +778,7 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
+         self.final_logit_softcapping = softcap if softcap > 0 else None
+ 
+     def context_kv_graph_state(self) -> tuple[tuple, tuple[torch.Tensor, ...]] | None:
+-        """Expose the addresses/scalars captured by the independent context graph."""
++        """Expose context addresses/scalars captured by the proposal graph."""
+         from vllm_kunlun.v1.attention.backends.kunlun_attn import KunlunAttentionImpl
+ 
+         model = self.model
+diff --git a/v1/sample/spec_decode/dflash.py b/v1/sample/spec_decode/dflash.py
+index d715b77..0eff01e 100644
+--- a/v1/sample/spec_decode/dflash.py
++++ b/v1/sample/spec_decode/dflash.py
+@@ -23,10 +23,8 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+ 
+ from vllm_kunlun.v1.sample.spec_decode.dflash_cudagraph import (
+-    DFlashContextCUDAGraphWrapper,
+     DFlashDrafterCUDAGraphWrapper,
+     DFlashProposalCUDAGraphWrapper,
+-    DFlashTailCUDAGraphWrapper,
+ )
+ 
+ logger = init_logger(__name__)
+@@ -128,11 +126,7 @@ class DFlashProposer(UpstreamDFlashProposer):
+         runner=None,
+     ) -> None:
+         self.is_dflash2 = is_dflash2_draft(vllm_config.speculative_config)
+-        self._dflash_tail_graph: DFlashTailCUDAGraphWrapper | None = None
+-        self._dflash_context_graph: DFlashContextCUDAGraphWrapper | None = None
+         self._dflash_proposal_graph: DFlashProposalCUDAGraphWrapper | None = None
+-        self._dflash_context_fallback_reason: str | None = None
+-        self._dflash_query_runtime_mode = CUDAGraphMode.NONE
+         super().__init__(vllm_config, device, runner=runner)
+         self._dflash_sample_indices_buffer = torch.empty(
+             self.input_ids.numel(),
+@@ -215,7 +209,6 @@ class DFlashProposer(UpstreamDFlashProposer):
+                 "DFlash2 graph padding must preserve complete request blocks: "
+                 f"num_input_tokens={num_input_tokens}, query_len={query_len}"
+             )
+-        self._dflash_query_runtime_mode = mode
+         return mode, num_input_tokens, num_tokens_across_dp
+ 
+     @override
+@@ -235,37 +228,10 @@ class DFlashProposer(UpstreamDFlashProposer):
+             )
+             logger.info(
+                 "DFlash2 proposal graph enabled (FP16/TP1/K3): max_entries=%d, "
+-                "max_bytes=%d; independent graphs are fallback paths",
++                "max_bytes=%d; fallback uses eager context/selection and configured query execution",
+                 self._dflash_proposal_graph.max_entries,
+                 self._dflash_proposal_graph.max_bytes,
+             )
+-        if (
+-            self.is_dflash2
+-            and os.getenv("VLLM_KUNLUN_DFLASH2_CONTEXT_CUDAGRAPH", "0") == "1"
+-        ):
+-            context_max_entries = os.getenv(
+-                "VLLM_KUNLUN_DFLASH2_CONTEXT_CUDAGRAPH_MAX_ENTRIES"
+-            )
+-            self._dflash_context_graph = DFlashContextCUDAGraphWrapper(
+-                self.model.precompute_and_store_context_kv,
+-                self.model.context_kv_graph_state,
+-                self.vllm_config,
+-                self.device,
+-                query_len=1 + self.dflash2_num_speculative_tokens,
+-                max_entries=(
+-                    int(context_max_entries)
+-                    if context_max_entries is not None
+-                    else None
+-                ),
+-            )
+-            logger.info(
+-                "DFlash2 context graph wrapper enabled: source=%s, max_entries=%d, "
+-                "limit_source=%s, XMLIR_FORCE_USE_XPU_GRAPH=%s",
+-                __file__,
+-                self._dflash_context_graph._max_entries,
+-                "explicit" if context_max_entries is not None else "auto",
+-                os.getenv("XMLIR_FORCE_USE_XPU_GRAPH"),
+-            )
+         if (
+             self.is_dflash2
+             and not self.dflash_causal
+@@ -278,41 +244,6 @@ class DFlashProposer(UpstreamDFlashProposer):
+                 query_len=1 + self.dflash2_num_speculative_tokens,
+                 causal=self.dflash_causal,
+             )
+-        if (
+-            self.is_dflash2
+-            and os.getenv("VLLM_KUNLUN_DFLASH2_TAIL_CUDAGRAPH", "0") == "1"
+-        ):
+-            tail_max_entries = os.getenv(
+-                "VLLM_KUNLUN_DFLASH2_TAIL_CUDAGRAPH_MAX_ENTRIES"
+-            )
+-            self._dflash_tail_graph = DFlashTailCUDAGraphWrapper(
+-                self._run_dflash2_tail,
+-                self.vllm_config,
+-                self.device,
+-                query_len=1 + self.dflash2_num_speculative_tokens,
+-                max_entries=(
+-                    int(tail_max_entries) if tail_max_entries is not None else None
+-                ),
+-            )
+-            logger.info(
+-                "DFlash2 tail graph wrapper enabled: proposer=%s.%s, source=%s, "
+-                "query_full_wrapper=%s, graph_mode=%s, target_eager=%s, "
+-                "draft_eager=%s, TP/DP/PP=%s/%s/%s, "
+-                "XMLIR_FORCE_USE_XPU_GRAPH=%s, max_entries=%d, limit_source=%s",
+-                type(self).__module__,
+-                type(self).__qualname__,
+-                __file__,
+-                isinstance(self.model, DFlashDrafterCUDAGraphWrapper),
+-                self.compilation_config.cudagraph_mode,
+-                self.vllm_config.model_config.enforce_eager,
+-                self.speculative_config.enforce_eager,
+-                self.vllm_config.parallel_config.tensor_parallel_size,
+-                self.vllm_config.parallel_config.data_parallel_size,
+-                self.vllm_config.parallel_config.pipeline_parallel_size,
+-                os.getenv("XMLIR_FORCE_USE_XPU_GRAPH"),
+-                self._dflash_tail_graph._max_entries,
+-                "explicit" if tail_max_entries is not None else "auto",
+-            )
+ 
+     def _dflash2_graph_ineligibility(self) -> str | None:
+         config = self.vllm_config
+@@ -356,34 +287,20 @@ class DFlashProposer(UpstreamDFlashProposer):
+             dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+         ) = None,
+     ) -> torch.Tensor:
+-        context_graph = self._dflash_context_graph
+-        tail_graph = self._dflash_tail_graph
+         proposal_graph = self._dflash_proposal_graph
+         reason = None
+-        if any(
+-            graph is not None for graph in (context_graph, tail_graph, proposal_graph)
+-        ):
++        if proposal_graph is not None:
++            proposal_graph.reset_result()
+             reason = self._dflash2_graph_ineligibility()
+-            # MRV1 gathers ([], is_mm_embed) even for text-only batches when
+-            # the target supports multimodal inputs. The tuple itself does not
+-            # imply that this proposal contains multimodal embeddings. Inspect
+-            # the host list, without reading or synchronizing the device mask.
++            # MRV1 also supplies an empty MM tuple for text-only Qwen batches.
++            # Inspect the host list without reading the device mask.
+             if mm_embed_inputs is not None and mm_embed_inputs[0]:
+                 reason = "multimodal_inputs"
+-        self._dflash_context_fallback_reason = reason
+-        if proposal_graph is not None:
+-            proposal_graph.reset_result()
+             if reason is not None:
+                 proposal_graph.record_fallback(
+                     reason, common_attn_metadata.batch_size()
+                 )
+-        if context_graph is not None:
+-            context_graph.reset_result()
+-        if tail_graph is not None:
+-            tail_graph.reset_result()
+-            if reason is not None:
+-                tail_graph.record_fallback(reason, common_attn_metadata.batch_size())
+-        if (tail_graph is None and proposal_graph is None) or reason is not None:
++        if proposal_graph is None or reason is not None:
+             return super().propose(
+                 num_speculative_tokens,
+                 target_token_ids,
+@@ -397,9 +314,8 @@ class DFlashProposer(UpstreamDFlashProposer):
+                 num_rejected_tokens_gpu,
+                 slot_mappings,
+             )
+-        # v0.25.1 gathers inside the base propose(), before _greedy_sample().
+-        # Keep this DFlash2-only first pass so gather can enter the tail graph;
+-        # context/query preparation still uses the original helpers exactly once.
++        # Prepare once before attempting the combined graph. Rejection has made
++        # no live KV writes, so the prepared inputs can continue eagerly below.
+         self.num_speculative_tokens = num_speculative_tokens
+         self._last_draft_probs = None
+         target_hidden_states = self.model.combine_hidden_states(target_hidden_states)
+@@ -423,27 +339,26 @@ class DFlashProposer(UpstreamDFlashProposer):
+         # declined proposal graph has made no live writes, so this first pass
+         # can safely continue on the original segmented/eager path.
+         query_slots = self._get_slot_mapping(num_input_tokens, draft_cad.slot_mapping)
+-        if proposal_graph is not None:
+-            with set_forward_context(
+-                per_layer_attn_metadata,
+-                self.vllm_config,
+-                num_tokens=num_input_tokens,
+-                num_tokens_across_dp=num_tokens_across_dp,
+-                cudagraph_runtime_mode=mode,
+-                slot_mapping=query_slots,
+-            ):
+-                count = self._dflash_num_context
+-                output = proposal_graph(
+-                    self._dflash_hidden_states,
+-                    self._context_positions_buffer[:count],
+-                    self._context_slot_mapping_buffer[:count],
+-                    self.input_ids[:num_input_tokens],
+-                    self._get_positions(num_input_tokens),
+-                    sample_indices,
+-                    capacity=min(num_tokens, self.max_num_tokens),
+-                )
+-            if output is not None:
+-                return output.view(-1, self.num_speculative_tokens)
++        with set_forward_context(
++            per_layer_attn_metadata,
++            self.vllm_config,
++            num_tokens=num_input_tokens,
++            num_tokens_across_dp=num_tokens_across_dp,
++            cudagraph_runtime_mode=mode,
++            slot_mapping=query_slots,
++        ):
++            count = self._dflash_num_context
++            output = proposal_graph(
++                self._dflash_hidden_states,
++                self._context_positions_buffer[:count],
++                self._context_slot_mapping_buffer[:count],
++                self.input_ids[:num_input_tokens],
++                self._get_positions(num_input_tokens),
++                sample_indices,
++                capacity=min(num_tokens, self.max_num_tokens),
++            )
++        if output is not None:
++            return output.view(-1, self.num_speculative_tokens)
+         model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
+             num_tokens, num_input_tokens, mm_embed_inputs
+         )
+@@ -461,49 +376,10 @@ class DFlashProposer(UpstreamDFlashProposer):
+         ):
+             result = self.model(**model_kwargs)
+             last_hidden_states = result[0] if self.model_returns_tuple() else result
+-        if tail_graph is None:
+-            return self._run_dflash2_tail(
+-                last_hidden_states, sample_indices, self.input_ids[:num_tokens]
+-            ).view(-1, self.num_speculative_tokens)
+-        return tail_graph(
+-            last_hidden_states,
+-            sample_indices,
+-            self.input_ids[:num_tokens],
+-            use_cudagraphs=mode != CUDAGraphMode.NONE,
++        return self._run_dflash2_tail(
++            last_hidden_states, sample_indices, self.input_ids[:num_tokens]
+         ).view(-1, self.num_speculative_tokens)
+ 
+-    @override
+-    def build_model_inputs_first_pass(
+-        self,
+-        num_tokens: int,
+-        num_input_tokens: int,
+-        mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
+-    ) -> tuple[dict[str, Any], int]:
+-        context_graph = self._dflash_context_graph
+-        if context_graph is None:
+-            return super().build_model_inputs_first_pass(
+-                num_tokens, num_input_tokens, mm_embed_inputs
+-            )
+-        count = self._dflash_num_context
+-        query_len = 1 + self.dflash2_num_speculative_tokens
+-        context_graph(
+-            self._dflash_hidden_states,
+-            self._context_positions_buffer[:count],
+-            self._context_slot_mapping_buffer[:count],
+-            num_reqs=num_tokens // query_len,
+-            capacity=min(num_tokens, self.max_num_tokens),
+-            use_cudagraphs=self._dflash_query_runtime_mode != CUDAGraphMode.NONE,
+-            fallback_reason=self._dflash_context_fallback_reason,
+-        )
+-        return (
+-            dict(
+-                input_ids=self.input_ids[:num_input_tokens],
+-                positions=self._get_positions(num_input_tokens),
+-                inputs_embeds=None,
+-            ),
+-            num_input_tokens,
+-        )
+-
+     def _run_dflash2_tail(
+         self,
+         hidden_states: torch.Tensor,
+diff --git a/v1/sample/spec_decode/dflash_cudagraph.py b/v1/sample/spec_decode/dflash_cudagraph.py
+index dcabe4c..6b63079 100644
+--- a/v1/sample/spec_decode/dflash_cudagraph.py
++++ b/v1/sample/spec_decode/dflash_cudagraph.py
+@@ -1,14 +1,14 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+-"""CUDA graphs for DFlash2 context KV, query forward and sampling tail."""
++"""DFlash2 proposal graphs and the existing query-only graph path."""
+ 
+ from __future__ import annotations
+ 
+ import copy
+ import os
+ from dataclasses import dataclass
+-from typing import Any, Callable
++from typing import Any
+ 
+ import torch
+ from vllm.compilation import monitor
+@@ -20,7 +20,6 @@ from vllm.forward_context import (
+     BatchDescriptor,
+     get_forward_context,
+     is_forward_context_available,
+-    set_forward_context,
+ )
+ from vllm.logger import init_logger
+ from vllm.model_executor.offloader.base import get_offloader
+@@ -50,7 +49,7 @@ def _capture_dflash_graph(
+             output = CUDAGraphWrapper.__call__(wrapper, *args)
+         entry = wrapper.concrete_cudagraph_entries[desc]
+         assert entry.cudagraph is not None
+-        entry.output = output  # Strong reference for the tail's graph-owned output.
++        entry.output = output  # Strong reference for the proposal's graph-owned output.
+         return entry
+     finally:
+         monitor.set_cudagraph_capturing_enabled(prev_enabled)
+@@ -64,463 +63,22 @@ class _DFlashContextInputs:
+     state_signature: tuple[Any, ...]
+     state_tensors: tuple[torch.Tensor, ...]
+ 
+-
+-class DFlashContextCUDAGraphWrapper(CUDAGraphWrapper):
+-    """Replay fixed-capacity context KV writes before the query forward.
+-
+-    Warmup/capture use finite zero inputs and PAD slots, so they cannot write
+-    live cache entries. Only replay consumes this proposal's slots. Overflow
+-    rows run once outside the graph; the captured prefix runs once inside it.
+-    """
+-
+-    def __init__(
+-        self,
+-        runnable: Callable[..., None],
+-        graph_state: Callable,
+-        vllm_config: VllmConfig,
+-        device: torch.device,
+-        query_len: int,
+-        max_entries: int | None = None,
+-    ) -> None:
+-        self._precompute_context_kv = runnable
+-        super().__init__(
+-            self._run_context,
+-            vllm_config,
+-            CUDAGraphMode.FULL,
+-            CUDAGraphOptions(weak_ref_output=False),
+-        )
+-        if query_len <= 1 or (max_entries is not None and max_entries < 1):
+-            raise ValueError(
+-                "DFlash2 context requires query_len > 1 and max_entries > 0"
+-            )
+-        self.graph_pool = current_platform.graph_pool_handle()
+-        self._device = device
+-        self._query_len = query_len
+-        self._max_entries_override = max_entries
+-        self._graph_state = graph_state
+-        self._inputs: dict[BatchDescriptor, _DFlashContextInputs] = {}
+-        self._stream_id: int | None = None
+-        self._reported_fallbacks: set[tuple[str, int]] = set()
+-        self.reset_result()
+-
+-    def _run_context(
+-        self,
+-        hidden_states: torch.Tensor,
+-        positions: torch.Tensor,
+-        slots: torch.Tensor,
+-    ) -> tuple[()]:
+-        self._precompute_context_kv(hidden_states, positions, slots)
+-        # v0.25.1 weak-refs entry.output even with weak_ref_output=False.
+-        # An empty tuple represents this side-effect-only callable without
+-        # allocating a dummy tensor or adding work to the captured graph.
+-        return ()
+-
+-    @property
+-    def _max_entries(self) -> int:
+-        if self._max_entries_override is not None:
+-            return self._max_entries_override
+-        return _max_dflash_graph_entries(self.vllm_config, self._query_len)
+-
+-    def reset_result(self) -> None:
+-        self.last_path = "context_not_called"
+-        self.last_fallback_reason: str | None = None
+-        self.last_num_context = self.last_capacity = self.last_overflow = 0
+-
+-    def clear_graphs(self) -> None:
+-        super().clear_graphs()
+-        self._inputs.clear()
+-        self._stream_id = None
+-        self._reported_fallbacks.clear()
+-        self.reset_result()
+-
+-    def fallback(self, hidden_states, positions, slots, num_reqs, reason) -> None:
+-        self.last_path = "context_graph_fallback"
+-        self.last_fallback_reason = reason
+-        key = (reason, num_reqs)
+-        if key not in self._reported_fallbacks:
+-            self._reported_fallbacks.add(key)
+-            logger.warning(
+-                "DFlash2 context graph fallback: reason=%s, B=%d, C=%d, "
+-                "cached_batches=%s, max_entries=%d",
+-                reason,
+-                num_reqs,
+-                hidden_states.shape[0],
+-                [desc.num_reqs for desc in self._inputs],
+-                self._max_entries,
+-            )
+-        self.runnable(hidden_states, positions, slots)
+-
+-    def stage_inputs(self, inputs, hidden_states, positions, slots) -> None:
+-        capacity = inputs.hidden_states.shape[0]
++    def stage(self, hidden_states, positions, slots) -> None:
++        capacity = self.hidden_states.shape[0]
+         if hidden_states.shape[0] == capacity:
+             # The common full-capacity case needs no source/destination views.
+-            inputs.hidden_states.copy_(hidden_states)
+-            inputs.positions.copy_(positions)
+-            inputs.slots.copy_(slots)
++            self.hidden_states.copy_(hidden_states)
++            self.positions.copy_(positions)
++            self.slots.copy_(slots)
+             return
+         count = min(capacity, hidden_states.shape[0])
+-        inputs.hidden_states[:count].copy_(hidden_states[:count])
+-        inputs.positions[:count].copy_(positions[:count])
+-        inputs.slots[:count].copy_(slots[:count])
++        self.hidden_states[:count].copy_(hidden_states[:count])
++        self.positions[:count].copy_(positions[:count])
++        self.slots[:count].copy_(slots[:count])
+         if count < capacity:
+-            inputs.hidden_states[count:].zero_()
+-            inputs.positions[count:].zero_()
+-            inputs.slots[count:].fill_(PAD_SLOT_ID)
+-
+-    def run_overflow(self, hidden_states, positions, slots, capacity) -> None:
+-        self.runnable(hidden_states[capacity:], positions[capacity:], slots[capacity:])
+-
+-    def __call__(
+-        self,
+-        hidden_states: torch.Tensor,
+-        positions: torch.Tensor,
+-        slots: torch.Tensor,
+-        num_reqs: int,
+-        capacity: int,
+-        use_cudagraphs: bool = True,
+-        fallback_reason: str | None = None,
+-    ) -> None:
+-        self.reset_result()
+-        count = hidden_states.shape[0]
+-        self.last_num_context = count
+-        if (
+-            hidden_states.ndim != 2
+-            or positions.ndim != 1
+-            or slots.ndim != 1
+-            or positions.numel() != count
+-            or slots.numel() != count
+-            or num_reqs <= 0
+-            or capacity <= 0
+-        ):
+-            raise ValueError("Invalid DFlash2 context graph inputs/capacity")
+-        reason = fallback_reason
+-        if reason is None and not use_cudagraphs:
+-            reason = "query_runtime_none"
+-        if reason is None and torch.cuda.is_current_stream_capturing():
+-            reason = "already_capturing"
+-        stream_id = torch.cuda.current_stream(self._device).cuda_stream
+-        if (
+-            reason is None
+-            and self._stream_id is not None
+-            and stream_id != self._stream_id
+-        ):
+-            reason = "different_stream"
+-        if reason is not None:
+-            return self.fallback(hidden_states, positions, slots, num_reqs, reason)
+-
+-        # Includes the native backend identity and every captured weight/cache
+-        # address. Retain tensors for the lifetime of the entry, even on fallback.
+-        state = self._graph_state()
+-        if state is None:
+-            return self.fallback(
+-                hidden_states, positions, slots, num_reqs, "model_state_unavailable"
+-            )
+-        state_metadata, state_tensors = state
+-        signature = (
+-            state_metadata,
+-            tuple(
+-                (t.data_ptr(), t.shape, t.stride(), t.dtype, t.device)
+-                for t in state_tensors
+-            ),
+-        )
+-        desc = BatchDescriptor(num_tokens=capacity, num_reqs=num_reqs, uniform=False)
+-        inputs = self._inputs.get(desc)
+-        if inputs is None:
+-            if len(self._inputs) >= self._max_entries:
+-                return self.fallback(
+-                    hidden_states, positions, slots, num_reqs, "entry_limit"
+-                )
+-            inputs = _DFlashContextInputs(
+-                hidden_states.new_empty((capacity, hidden_states.shape[1])),
+-                positions.new_empty(capacity),
+-                slots.new_empty(capacity),
+-                signature,
+-                state_tensors,
+-            )
+-            self._inputs[desc] = inputs
+-        elif inputs.state_signature != signature:
+-            return self.fallback(
+-                hidden_states, positions, slots, num_reqs, "model_state_changed"
+-            )
+-        elif any(
+-            (dst.dtype, dst.device, dst.shape[1:])
+-            != (src.dtype, src.device, src.shape[1:])
+-            for dst, src in (
+-                (inputs.hidden_states, hidden_states),
+-                (inputs.positions, positions),
+-                (inputs.slots, slots),
+-            )
+-        ):
+-            return self.fallback(
+-                hidden_states, positions, slots, num_reqs, "input_signature_changed"
+-            )
+-
+-        args = (inputs.hidden_states, inputs.positions, inputs.slots)
+-        entry = self.concrete_cudagraph_entries.get(desc)
+-        capturing = entry is None or entry.cudagraph is None
+-        if capturing:
+-            inputs.hidden_states.zero_()
+-            inputs.positions.zero_()
+-            inputs.slots.fill_(PAD_SLOT_ID)
+-            with set_forward_context(
+-                None,
+-                self.vllm_config,
+-                num_tokens=capacity,
+-                cudagraph_runtime_mode=CUDAGraphMode.FULL,
+-            ):
+-                ctx = get_forward_context()
+-                ctx.batch_descriptor = desc
+-                ctx.skip_compiled = True
+-                try:
+-                    # No real slots have been staged: both runs are KV-inert.
+-                    self.runnable(*args)
+-                    entry = _capture_dflash_graph(self, desc, args)
+-                except BaseException:
+-                    self.concrete_cudagraph_entries.pop(desc, None)
+-                    self._inputs.pop(desc, None)
+-                    raise
+-            self._stream_id = stream_id
+-            logger.info(
+-                "Captured DFlash2 context KV graph: B=%d, capacity=%d, backend=%s.%s",
+-                num_reqs,
+-                capacity,
+-                type(entry.cudagraph).__module__,
+-                type(entry.cudagraph).__qualname__,
+-            )
+-
+-        self.stage_inputs(inputs, hidden_states, positions, slots)
+-        if count > capacity:
+-            self.run_overflow(hidden_states, positions, slots, capacity)
+-        get_offloader().sync_prev_onload()
+-        entry.cudagraph.replay()
+-        self.last_path = (
+-            "context_graph_capture" if capturing else "context_graph_replay"
+-        )
+-        self.last_capacity = capacity
+-        self.last_overflow = max(0, count - capacity)
+-
+-
+-@dataclass
+-class _DFlashTailInputs:
+-    hidden_states: torch.Tensor
+-    sample_indices: torch.Tensor
+-    input_ids: torch.Tensor
+-
+-
+-class DFlashTailCUDAGraphWrapper(CUDAGraphWrapper):
+-    """Capture gather, candidate generation, selector and native walk together.
+-
+-    Only the sampling tail runs during warmup/capture: it does not write KV or
+-    advance request state. Use a private pool so query/target graphs cannot
+-    overwrite its tensors. A clone outside capture gives each caller independent
+-    output storage, including while the runner copies previous IDs asynchronously.
+-    The vLLM graph registry also clears this wrapper via clear_all_graphs().
+-    """
+-
+-    def __init__(
+-        self,
+-        runnable: Callable[..., torch.Tensor],
+-        vllm_config: VllmConfig,
+-        device: torch.device,
+-        query_len: int,
+-        max_entries: int | None = None,
+-    ) -> None:
+-        super().__init__(
+-            runnable,
+-            vllm_config,
+-            CUDAGraphMode.FULL,
+-            CUDAGraphOptions(weak_ref_output=False),
+-        )
+-        if (max_entries is not None and max_entries < 1) or query_len <= 1:
+-            raise ValueError("DFlash2 tail requires max_entries > 0 and query_len > 1")
+-        self.graph_pool = current_platform.graph_pool_handle()
+-        self._device = device
+-        self._query_len = query_len
+-        self._max_entries_override = max_entries
+-        self._inputs: dict[BatchDescriptor, _DFlashTailInputs] = {}
+-        self._stream_id: int | None = None
+-        self._reported_fallbacks: set[tuple[str, int]] = set()
+-        self._reported_replays: set[BatchDescriptor] = set()
+-        self.reset_result()
+-
+-    @property
+-    def _max_entries(self) -> int:
+-        if self._max_entries_override is not None:
+-            return self._max_entries_override
+-        # K is fixed, and each actual B has exactly one tail descriptor. Allow
+-        # all B within the engine's configured graph range rather than pinning
+-        # the cache to whichever B happened to arrive first. Read the finalized
+-        # config here: MRV1 can adjust capture sizes after model loading.
+-        return _max_dflash_graph_entries(self.vllm_config, self._query_len)
+-
+-    def reset_result(self) -> None:
+-        self.last_path = "tail_not_called"
+-        self.last_fallback_reason: str | None = None
+-
+-    def clear_graphs(self) -> None:
+-        # Called at the same quiescent boundary as vLLM's other graph wrappers.
+-        super().clear_graphs()
+-        self._inputs.clear()
+-        self._stream_id = None
+-        self._reported_replays.clear()
+-        self.reset_result()
+-
+-    def record_fallback(self, reason: str, num_reqs: int) -> None:
+-        self.last_path = "tail_graph_fallback"
+-        self.last_fallback_reason = reason
+-        key = (reason, num_reqs)
+-        if key not in self._reported_fallbacks:
+-            self._reported_fallbacks.add(key)
+-            logger.warning(
+-                "DFlash2 tail graph fallback: reason=%s, B=%d, K=%d, "
+-                "cached_batches=%s, max_entries=%d, limit_source=%s, "
+-                "graph_mode=%s, capture_limit=%s",
+-                reason,
+-                num_reqs,
+-                self._query_len - 1,
+-                [desc.num_reqs for desc in self._inputs],
+-                self._max_entries,
+-                "explicit" if self._max_entries_override is not None else "auto",
+-                self.compilation_config.cudagraph_mode,
+-                self.compilation_config.max_cudagraph_capture_size,
+-            )
+-
+-    def fallback(
+-        self,
+-        hidden_states: torch.Tensor,
+-        sample_indices: torch.Tensor,
+-        input_ids: torch.Tensor,
+-        reason: str,
+-    ) -> torch.Tensor:
+-        num_reqs = sample_indices.numel() // (self._query_len - 1)
+-        self.record_fallback(reason, num_reqs)
+-        return self.runnable(hidden_states, sample_indices, input_ids)
+-
+-    def stage_inputs(
+-        self,
+-        inputs: _DFlashTailInputs,
+-        hidden_states: torch.Tensor,
+-        sample_indices: torch.Tensor,
+-        input_ids: torch.Tensor,
+-    ) -> None:
+-        inputs.hidden_states.copy_(hidden_states)
+-        inputs.sample_indices.copy_(sample_indices)
+-        inputs.input_ids.copy_(input_ids)
+-
+-    @staticmethod
+-    def copy_output(output: torch.Tensor) -> torch.Tensor:
+-        # Allocation occurs outside the graph pool. The consumer owns this copy;
+-        # no fixed ring size or assumption about the number of in-flight steps.
+-        return output.clone()
+-
+-    def __call__(
+-        self,
+-        hidden_states: torch.Tensor,
+-        sample_indices: torch.Tensor,
+-        input_ids: torch.Tensor,
+-        use_cudagraphs: bool = True,
+-    ) -> torch.Tensor:
+-        self.reset_result()
+-        num_samples = sample_indices.numel()
+-        num_reqs, remainder = divmod(num_samples, self._query_len - 1)
+-        if remainder or num_reqs <= 0:
+-            raise ValueError("DFlash2 tail requires complete, nonempty request blocks")
+-        num_query = num_reqs * self._query_len
+-        if hidden_states.ndim != 2 or hidden_states.shape[0] < num_query:
+-            raise ValueError("DFlash2 tail requires all query hidden-state rows")
+-        hidden_states = hidden_states[:num_query]
+-        input_ids = input_ids[:num_query]
+-        if not use_cudagraphs:
+-            return self.fallback(
+-                hidden_states, sample_indices, input_ids, "query_runtime_none"
+-            )
+-        if torch.cuda.is_current_stream_capturing():
+-            return self.fallback(
+-                hidden_states, sample_indices, input_ids, "already_capturing"
+-            )
+-        stream_id = torch.cuda.current_stream(self._device).cuda_stream
+-        if self._stream_id is not None and stream_id != self._stream_id:
+-            return self.fallback(
+-                hidden_states, sample_indices, input_ids, "different_stream"
+-            )
+-        desc = BatchDescriptor(num_tokens=num_query, num_reqs=num_reqs, uniform=False)
+-        inputs = self._inputs.get(desc)
+-        if inputs is None:
+-            if len(self._inputs) >= self._max_entries:
+-                return self.fallback(
+-                    hidden_states, sample_indices, input_ids, "entry_limit"
+-                )
+-            inputs = _DFlashTailInputs(
+-                torch.empty_like(hidden_states),
+-                torch.empty_like(sample_indices),
+-                torch.empty_like(input_ids),
+-            )
+-            self._inputs[desc] = inputs
+-        elif any(
+-            (dst.shape, dst.dtype, dst.device) != (src.shape, src.dtype, src.device)
+-            for dst, src in (
+-                (inputs.hidden_states, hidden_states),
+-                (inputs.sample_indices, sample_indices),
+-                (inputs.input_ids, input_ids),
+-            )
+-        ):
+-            return self.fallback(
+-                hidden_states, sample_indices, input_ids, "input_signature_changed"
+-            )
+-        self.stage_inputs(inputs, hidden_states, sample_indices, input_ids)
+-        args = (inputs.hidden_states, inputs.sample_indices, inputs.input_ids)
+-        with set_forward_context(
+-            None,
+-            self.vllm_config,
+-            num_tokens=num_query,
+-            cudagraph_runtime_mode=CUDAGraphMode.FULL,
+-        ):
+-            ctx = get_forward_context()
+-            ctx.batch_descriptor = desc
+-            # The selector's decorated __call__ must not compile/capture an
+-            # inner PIECEWISE graph during the outer tail capture.
+-            ctx.skip_compiled = True
+-            entry = self.concrete_cudagraph_entries.get(desc)
+-            if entry is not None and entry.cudagraph is not None:
+-                # Call the captured API directly. The generic wrapper can also
+-                # dispatch its runnable eagerly; that must not count as replay.
+-                get_offloader().sync_prev_onload()
+-                entry.cudagraph.replay()
+-                output = entry.output
+-                self.last_path = "tail_graph_replay"
+-                if desc not in self._reported_replays:
+-                    self._reported_replays.add(desc)
+-                    logger.info(
+-                        "DFlash2 tail graph replay API called: B=%d, K=%d, "
+-                        "backend=%s.%s (device graph launch requires trace validation)",
+-                        num_reqs,
+-                        self._query_len - 1,
+-                        type(entry.cudagraph).__module__,
+-                        type(entry.cudagraph).__qualname__,
+-                    )
+-            else:
+-                self.last_path = "tail_graph_capture"
+-                self._stream_id = stream_id
+-                try:
+-                    # Initialize native libraries/workspaces before capture,
+-                    # with the same eager selector used by the captured tail.
+-                    self.runnable(*args)
+-                    entry = _capture_dflash_graph(self, desc, args)
+-                    output = entry.output
+-                    # Capture alone does not execute this proposal.
+-                    entry.cudagraph.replay()
+-                    logger.info(
+-                        "Captured DFlash2 sampling tail graph: %s, backend=%s.%s",
+-                        desc,
+-                        type(entry.cudagraph).__module__,
+-                        type(entry.cudagraph).__qualname__,
+-                    )
+-                except BaseException:
+-                    # Do not silently retry a failed capture on the live path.
+-                    self.concrete_cudagraph_entries.pop(desc, None)
+-                    self._inputs.pop(desc, None)
+-                    raise
+-        return self.copy_output(output)
++            self.hidden_states[count:].zero_()
++            self.positions[count:].zero_()
++            self.slots[count:].fill_(PAD_SLOT_ID)
+ 
+ 
+ @dataclass(frozen=True)
+@@ -952,9 +510,7 @@ class DFlashProposalCUDAGraphWrapper(DFlashDrafterCUDAGraphWrapper):
+         samples,
+         metadata,
+     ):
+-        DFlashContextCUDAGraphWrapper.stage_inputs(
+-            self, inputs.context, context, context_positions, context_slots
+-        )
++        inputs.context.stage(context, context_positions, context_slots)
+         inputs.input_ids.copy_(ids)
+         inputs.positions.copy_(positions)
+         inputs.sample_indices.copy_(samples)

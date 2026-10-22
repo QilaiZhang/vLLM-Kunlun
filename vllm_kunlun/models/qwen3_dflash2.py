@@ -637,7 +637,8 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
         for norm in norms:
             weight_fp32 = norm.weight.detach().float()
             if hasattr(norm, "_dflash_weight_fp32"):
-                norm._dflash_weight_fp32 = weight_fp32
+                # Preserve the address used by existing compiled query code.
+                norm._dflash_weight_fp32.copy_(weight_fp32)
             else:
                 norm.register_buffer(
                     "_dflash_weight_fp32",
@@ -776,6 +777,51 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
         self.output_multiplier = float(draft_config.get("output_multiplier", 1.0))
         softcap = float(draft_config.get("final_logit_softcapping") or 0.0)
         self.final_logit_softcapping = softcap if softcap > 0 else None
+
+    def prepare_for_graph(self) -> tuple[torch.Tensor, ...] | None:
+        """Prepare static context storages before capture; hold them until clear."""
+        from vllm_kunlun.v1.attention.backends.kunlun_attn import KunlunAttentionImpl
+
+        model = self.model
+        if not hasattr(model, "_num_attn_layers"):
+            model._build_fused_kv_buffers()
+        if any(
+            type(layer.impl) is not KunlunAttentionImpl
+            or not isinstance(layer.kv_cache, torch.Tensor)
+            or layer.kv_cache.numel() == 0
+            for layer in model._attn_layers
+        ):
+            return None
+        rotary = model.layers[0].self_attn.rotary_emb
+        # Match the projection dtype outside capture; subsequent calls reuse it.
+        rope_cache = rotary._match_cos_sin_cache_dtype(model._fused_kv_weight)
+        tensors = (
+            model._hidden_norm_weight,
+            model._fused_kv_weight,
+            model._k_norm_weights,
+            rope_cache,
+            *(layer.kv_cache for layer in model._attn_layers),
+        )
+        if model._fused_kv_bias is not None:
+            tensors += (model._fused_kv_bias,)
+        return tensors
+
+    def reset_graph_state(self) -> None:
+        """Invalidate derived weights when runner resources are rebuilt."""
+        model = self.model
+        for name in (
+            "_num_attn_layers",
+            "_attn_layers",
+            "_hidden_norm_weight",
+            "_fused_kv_weight",
+            "_fused_kv_bias",
+            "_k_norm_weights",
+            "_rope_cos_sin_cache",
+        ):
+            if hasattr(model, name):
+                delattr(model, name)
+        # Keep norm buffers allocated: sleep/wake may temporarily unmap their
+        # storage. The next context preparation refreshes their values in place.
 
     def compute_candidates(
         self, hidden_states: torch.Tensor

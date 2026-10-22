@@ -1,0 +1,172 @@
+diff --git a/profile_dflash2_proposal.py b/profile_dflash2_proposal.py
+index ad7b0f1..ac01b33 100644
+--- a/profile_dflash2_proposal.py
++++ b/profile_dflash2_proposal.py
+@@ -10,6 +10,7 @@ excluded from performance conclusions.
+ from __future__ import annotations
+ 
+ import functools
++import heapq
+ import inspect
+ import math
+ import os
+@@ -77,6 +78,8 @@ class _Proposal:
+     stack: list[_Span] = field(default_factory=list)
+     graph_path: str = "without_full_graph_wrapper"
+     fallback_reason: str | None = None
++    proposal_graph_path: str = "proposal_disabled"
++    proposal_fallback_reason: str | None = None
+     query_end_ns: int | None = None
+     capture: bool = False
+ 
+@@ -117,6 +120,8 @@ class ProposalProfiler:
+         self.drafted_per_position: Counter[int] = Counter()
+         self._event_pairs: list[tuple[str, Any]] = []
+         self.in_flight_at_stop = 0
++        self._proposal_ordinal = 0
++        self._slow_proposals = []
+ 
+     def start(self) -> None:
+         with self._lock:
+@@ -245,6 +250,10 @@ class ProposalProfiler:
+                 combined_path = (
+                     combined.last_path if combined is not None else "proposal_disabled"
+                 )
++                proposal.proposal_graph_path = combined_path
++                proposal.proposal_fallback_reason = (
++                    combined.last_fallback_reason if combined is not None else None
++                )
+                 combined_hit = combined_path in (
+                     "proposal_graph_capture",
+                     "proposal_graph_replay",
+@@ -269,6 +278,7 @@ class ProposalProfiler:
+                 with self._lock:
+                     if not self.active:
+                         return result
++                    self._proposal_ordinal += 1
+                     self.graph_paths[proposal.graph_path] += 1
+                     if proposal.fallback_reason:
+                         self.fallback_reasons[proposal.fallback_reason] += 1
+@@ -312,6 +322,15 @@ class ProposalProfiler:
+                             self._add(self.stages, span)
+                             if span.events is not None:
+                                 self._event_pairs.append((span.name, span.events))
++                        item = (
++                            proposal.spans[-1].elapsed_ns,
++                            self._proposal_ordinal,
++                            proposal,
++                        )
++                        if len(self._slow_proposals) < 3:
++                            heapq.heappush(self._slow_proposals, item)
++                        elif item[0] > self._slow_proposals[0][0]:
++                            heapq.heapreplace(self._slow_proposals, item)
+                 return result
+             finally:
+                 self._local.proposal = None
+@@ -320,6 +339,32 @@ class ProposalProfiler:
+ 
+         return wrapped
+ 
++    def _slow_proposal_summary(self):
++        result = []
++        for elapsed, ordinal, proposal in sorted(self._slow_proposals, reverse=True):
++            start = proposal.spans[-1].start_ns
++            result.append(
++                {
++                    "ordinal": ordinal,
++                    "graph_path": proposal.graph_path,
++                    "fallback_reason": proposal.fallback_reason,
++                    "proposal_graph_path": proposal.proposal_graph_path,
++                    "proposal_fallback_reason": proposal.proposal_fallback_reason,
++                    "host_total_ms": elapsed / 1e6,
++                    "spans": [
++                        {
++                            "name": span.name,
++                            "start_offset_ms": (span.start_ns - start) / 1e6,
++                            "host_total_ms": span.elapsed_ns / 1e6,
++                            "host_self_ms": max(0, span.elapsed_ns - span.children_ns)
++                            / 1e6,
++                        }
++                        for span in proposal.spans
++                    ],
++                }
++            )
++        return result
++
+     def observe_acceptance(self, drafted: int, accepted: int) -> None:
+         if self.active:
+             with self._lock:
+@@ -601,6 +646,7 @@ class ProposalProfiler:
+             "proposal_fallback_reasons": dict(self.proposal_fallback_reasons),
+             "proposal_rows": dict(self.proposal_rows),
+             "duplicate_segment_dispatches": self.duplicate_segment_dispatches,
++            "slow_proposals": self._slow_proposal_summary(),
+             "proposal_graph_cache": [
+                 {
+                     "entries": len(wrapper._inputs),
+@@ -707,6 +753,7 @@ class ProposalProfiler:
+                 "proposal_dispatch_breakdown": "descriptor and host_plan_check keep full validation; offloader_sync precedes graph_submit; graph_submit is the replay API call, not device kernel duration; output_copy retains independent storage; attention_graph_signature covers both combined and legacy query paths; added nested stages change dispatch self accounting",
+                 "context_state_guard": "every cache hit checks live context bindings/addresses/layout/scalars after parameter checks; context_graph_state runs on initialization or guard miss; cached counters include warmup; replay source is collected only in summary",
+                 "parameter_layout_guard": "torch_root_tensor_match checks parameter layout inside the binding/address guard tree; other backends retain the original separate layout checker; a failed guard is confirmed with the full original checks",
++                "slow_proposals": "up to 3 slowest successful non-capture proposals, with all existing spans from the same call; ordinal includes successful cold proposals since start(); inclusive nested spans are not additive; serialization runs in summary without new device synchronization",
+             },
+         }
+ 
+diff --git a/profile_slot_mappings.py b/profile_slot_mappings.py
+index bd12573..690f753 100644
+--- a/profile_slot_mappings.py
++++ b/profile_slot_mappings.py
+@@ -114,6 +114,7 @@ def environment_snapshot(torch: Any) -> dict[str, Any]:
+         "vllm_kunlun.v1.sample.spec_decode.dflash",
+         "vllm_kunlun.v1.sample.spec_decode.dflash_cudagraph",
+         "vllm_kunlun.models.qwen3_dflash2",
++        "vllm_kunlun.v1.attention.backends.kunlun_attn",
+         "vllm.v1.spec_decode.llm_base_proposer",
+         "vllm.compilation.cuda_graph",
+         "vllm_kunlun.models.qwen3_5",
+diff --git a/v1/attention/backends/kunlun_attn.py b/v1/attention/backends/kunlun_attn.py
+index c29a042..85d4f47 100644
+--- a/v1/attention/backends/kunlun_attn.py
++++ b/v1/attention/backends/kunlun_attn.py
+@@ -579,8 +579,9 @@ class KunlunAttentionMetadataBuilder:
+         if buf is None or buf.numel() < num:
+             buf = torch.empty(max(num, self._max_reqs + 1), dtype=dtype, device=device)
+             self._buf_cache[ck] = buf
+-        out = buf[:num]
+-        out.copy_(src[:num], non_blocking=True)
++        out = buf if buf.numel() == num else buf[:num]
++        source = src if src.shape[0] == num else src[:num]
++        out.copy_(source, non_blocking=True)
+         return out
+ 
+     def _init_reorder_batch_threshold(
+@@ -696,9 +697,14 @@ class KunlunAttentionMetadataBuilder:
+                 max(num_reqs + 1, self._max_reqs + 1), dtype=torch.int32, device="cpu"
+             )
+             self._buf_cache[ck] = buf
+-        out = buf[: num_reqs + 1]
++        out = buf if buf.numel() == num_reqs + 1 else buf[: num_reqs + 1]
+         out[0] = 0
+-        torch.cumsum(seq_lens_cpu[:num_reqs].to(torch.int32), dim=0, out=out[1:])
++        lengths = (
++            seq_lens_cpu
++            if seq_lens_cpu.shape[0] == num_reqs
++            else seq_lens_cpu[:num_reqs]
++        )
++        torch.cumsum(lengths.to(torch.int32), dim=0, out=out[1:])
+         return out
+ 
+     def _staged_kv_lod_xpu(self, seq_lens: torch.Tensor, num_reqs: int) -> torch.Tensor:
+@@ -712,9 +718,10 @@ class KunlunAttentionMetadataBuilder:
+                 device=self.device,
+             )
+             self._buf_cache[ck] = buf
+-        out = buf[: num_reqs + 1]
++        out = buf if buf.numel() == num_reqs + 1 else buf[: num_reqs + 1]
+         out[0].zero_()
+-        torch.cumsum(seq_lens[:num_reqs], dim=0, dtype=torch.int32, out=out[1:])
++        lengths = seq_lens if seq_lens.shape[0] == num_reqs else seq_lens[:num_reqs]
++        torch.cumsum(lengths, dim=0, dtype=torch.int32, out=out[1:])
+         return out
+ 
+     def build(

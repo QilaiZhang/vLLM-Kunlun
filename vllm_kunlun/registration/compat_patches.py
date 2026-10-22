@@ -285,10 +285,49 @@ def _apply_eagle_patch(module: ModuleType) -> None:
 # --- vllm.v1.worker.gpu_model_runner: dispatch DFlash through Kunlun ------
 
 
+def _with_dflash_graph_invalidation(method, worker=False):
+    """Resource changes are cold, quiescent boundaries, not inference checks."""
+
+    @functools.wraps(method)
+    def changed(self, *args, **kwargs):
+        runner = getattr(self, "model_runner", None) if worker else self
+
+        def invalidate():
+            drafter = getattr(runner, "drafter", None)
+            if getattr(drafter, "is_dflash2", False):
+                drafter.clear_graphs(method.__name__)
+
+        invalidate()
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            # Also cover failed/partial mutations and newly loaded drafters.
+            invalidate()
+
+    return changed
+
+
+def _patch_dflash_lifecycle(cls, methods, worker=False):
+    if getattr(cls, "_kunlun_dflash_lifecycle_patched", False):
+        return
+    if any(not callable(getattr(cls, name, None)) for name in methods):
+        raise RuntimeError("Unsupported MRV1 DFlash2 resource lifecycle API")
+    for name in methods:
+        setattr(cls, name, _with_dflash_graph_invalidation(getattr(cls, name), worker))
+    cls._kunlun_dflash_lifecycle_patched = True
+
+
 def _dflash_runner_applied(module: ModuleType) -> bool:
     """Return whether the runner constructs the Kunlun DFlash proposer."""
     cls = getattr(module, "DFlashProposer", None)
-    return cls is None or getattr(cls, "__module__", "").startswith("vllm_kunlun")
+    return cls is None or (
+        getattr(cls, "__module__", "").startswith("vllm_kunlun")
+        and getattr(
+            getattr(module, "GPUModelRunner", None),
+            "_kunlun_dflash_lifecycle_patched",
+            False,
+        )
+    )
 
 
 def _apply_dflash_runner_patch(module: ModuleType) -> None:
@@ -297,6 +336,17 @@ def _apply_dflash_runner_patch(module: ModuleType) -> None:
         return
     from vllm_kunlun.v1.sample.spec_decode.dflash import DFlashProposer
 
+    _patch_dflash_lifecycle(
+        module.GPUModelRunner,
+        (
+            "load_model",
+            "reload_weights",
+            "update_config",
+            "initialize_kv_cache",
+            "initialize_kv_cache_tensors",
+            "post_kv_cache_wake_up",
+        ),
+    )
     module.DFlashProposer = DFlashProposer
     logging.getLogger("vllm_kunlun").info(
         "[KunlunPlugin] GPUModelRunner DFlash proposer patched"
@@ -422,12 +472,33 @@ def _apply_memory_pool_patch(module: ModuleType) -> None:
 
 
 def _gpu_worker_patches_applied(module: ModuleType) -> bool:
-    """Return whether both Kunlun gpu_worker compatibility patches apply."""
-    return _memory_pool_applied(module) and _gpu_model_runner_applied(module)
+    """Return whether worker compatibility and DFlash lifecycle hooks apply."""
+    if not hasattr(module, "Worker"):
+        return True
+    return (
+        _memory_pool_applied(module)
+        and _gpu_model_runner_applied(module)
+        and getattr(
+            getattr(module, "Worker", None), "_kunlun_dflash_lifecycle_patched", False
+        )
+    )
 
 
 def _apply_gpu_worker_patches(module: ModuleType) -> None:
-    """Apply memory-pool and speculative Mamba patches from one hook target."""
+    """Install lifecycle hooks independently of optional compatibility patches."""
+    if not hasattr(module, "Worker"):
+        return
+    _patch_dflash_lifecycle(
+        module.Worker,
+        (
+            "sleep",
+            "wake_up",
+            "start_weight_update",
+            "update_weights",
+            "finish_weight_update",
+        ),
+        worker=True,
+    )
     if not _memory_pool_applied(module):
         _apply_memory_pool_patch(module)
     if not _gpu_model_runner_applied(module):

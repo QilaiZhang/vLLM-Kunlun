@@ -1,0 +1,153 @@
+diff --git a/profile_dflash2_proposal.py b/profile_dflash2_proposal.py
+index 75c9d42..98c41dc 100644
+--- a/profile_dflash2_proposal.py
++++ b/profile_dflash2_proposal.py
+@@ -518,6 +518,9 @@ class ProposalProfiler:
+             ("stage_inputs", "proposal_graph_staging"),
+             ("run_overflow", "proposal_graph_overflow"),
+             ("graph_state", "proposal_graph_state"),
++            ("_parameters_unchanged", "proposal_parameter_check"),
++            ("_attach_buffers", "proposal_buffer_attach"),
++            ("_detach_buffers", "proposal_buffer_detach"),
+         ):
+             self._patch(
+                 proposal_cls, name, self.wrap_stage(stage, getattr(proposal_cls, name))
+@@ -576,6 +579,11 @@ class ProposalProfiler:
+                         if wrapper._parameter_guard is not None
+                         else "python"
+                     ),
++                    "binding_guard_backend": (
++                        "torch_root_guard"
++                        if wrapper._binding_guard is not None
++                        else "python"
++                    ),
+                     "planning_policy": "fixed_full_equivalent; geometric_across_window",
+                     "planning_state": wrapper.planning_state,
+                     "planning_counts": dict(wrapper.planning_counts),
+diff --git a/v1/sample/spec_decode/dflash_cudagraph.py b/v1/sample/spec_decode/dflash_cudagraph.py
+index 3605a24..87773b1 100644
+--- a/v1/sample/spec_decode/dflash_cudagraph.py
++++ b/v1/sample/spec_decode/dflash_cudagraph.py
+@@ -769,6 +769,8 @@ class DFlashProposalCUDAGraphWrapper(DFlashDrafterCUDAGraphWrapper):
+         self._parameter_bindings = None
+         self._parameter_tensors = self._parameter_signature = ()
+         self._parameter_guard = None
++        self._binding_guard = None
++        self._binding_guard_inputs = ()
+         self._model_state_changed = False
+         self.state_checks = self.parameter_snapshots = self.cached_rejections = 0
+         self.capture_attempts = self.post_capture_rejections = 0
+@@ -852,6 +854,8 @@ class DFlashProposalCUDAGraphWrapper(DFlashDrafterCUDAGraphWrapper):
+         self._parameter_bindings = None
+         self._parameter_tensors = self._parameter_signature = ()
+         self._parameter_guard = None
++        self._binding_guard = None
++        self._binding_guard_inputs = ()
+         self._model_state_changed = False
+         self.state_checks = self.parameter_snapshots = self.cached_rejections = 0
+         self.capture_attempts = self.post_capture_rejections = 0
+@@ -976,6 +980,7 @@ class DFlashProposalCUDAGraphWrapper(DFlashDrafterCUDAGraphWrapper):
+                 for t in self._parameter_tensors
+             )
+             self._build_parameter_guard()
++            self._build_binding_guard()
+             self.parameter_snapshots += 1
+         elif not self._parameters_unchanged():
+             self._model_state_changed = True
+@@ -1013,6 +1018,17 @@ class DFlashProposalCUDAGraphWrapper(DFlashDrafterCUDAGraphWrapper):
+             self._parameter_guard = None
+ 
+     def _parameters_unchanged(self):
++        if self._binding_guard is not None and self._parameter_guard is not None:
++            try:
++                if self._binding_guard.check(self._binding_guard_inputs):
++                    if self._parameter_guard.check(*self._parameter_tensors):
++                        return True
++            except (TypeError, RuntimeError):
++                pass
++            # Internal APIs and TLS guards vary across builds. Confirm failure
++            # with the original checks before declaring model state invalid.
++            self._binding_guard = None
++            self._binding_guard_inputs = ()
+         # Compare names and object identities with C-level tuple/map loops;
+         # never compare Parameter values (which would dispatch tensor ops).
+         # Snapshots retain every module/parameter, so IDs cannot be recycled.
+@@ -1056,6 +1072,55 @@ class DFlashProposalCUDAGraphWrapper(DFlashDrafterCUDAGraphWrapper):
+             for t, sig in zip(self._parameter_tensors, self._parameter_signature)
+         )
+ 
++    def _build_binding_guard(self):
++        # Check the live mappings and tensor addresses in one host guard tree.
++        # TensorGuards alone permits storage replacement. Retain strong refs
++        # and validate every replay; this does not compile or run device ops.
++        if self._parameter_guard is None:
++            return
++        try:
++            from torch._dynamo.guards import GuardManagerType
++
++            def add_guard(method, value):
++                try:
++                    method(value, [])  # PyTorch 2.9.
++                except TypeError:
++                    method(value, [], None)  # Newer user_stack argument.
++
++            kind = GuardManagerType.GUARD_MANAGER
++            root = torch._C._dynamo.guards.RootGuardManager()
++            modules = tuple(binding[0] for binding in self._parameter_bindings)
++            guard_inputs = (modules, self._parameter_tensors)
++            module_guard = root.tuple_getitem_manager(0, "modules", modules, kind)
++            for index, module in enumerate(modules):
++                guard = module_guard.tuple_getitem_manager(
++                    index, str(index), module, kind
++                )
++                for name in ("_modules", "_parameters"):
++                    mapping = getattr(module, name)
++                    child = guard.getattr_manager(name, name, mapping, kind)
++                    add_guard(child.add_id_match_guard, id(mapping))
++                    add_guard(child.add_dict_version_guard, mapping)
++            parameters = root.tuple_getitem_manager(
++                1, "parameters", self._parameter_tensors, kind
++            )
++            for index, (tensor, sig) in enumerate(
++                zip(self._parameter_tensors, self._parameter_signature)
++            ):
++                guard = parameters.tuple_getitem_manager(
++                    index, str(index), tensor, kind
++                )
++                pointer = guard.lambda_manager(
++                    torch.Tensor.data_ptr, "data_ptr", sig[0], kind
++                )
++                add_guard(pointer.add_equals_match_guard, sig[0])
++            if root.check(guard_inputs):
++                self._binding_guard = root
++                self._binding_guard_inputs = guard_inputs
++        except (AttributeError, ImportError, TypeError, RuntimeError):
++            self._binding_guard = None
++            self._binding_guard_inputs = ()
++
+     def _minimum_bytes(self, desc, context, ids, positions, samples, metadata):
+         staged = context.element_size() * desc.context_capacity * context.shape[1]
+         staged += 16 * desc.context_capacity  # int64 context positions/slots
+@@ -1269,8 +1334,11 @@ class DFlashProposalCUDAGraphWrapper(DFlashDrafterCUDAGraphWrapper):
+         entry = self.concrete_cudagraph_entries.get(desc)
+         capturing = entry is None or entry.cudagraph is None
+         try:
+-            self._attach_buffers(desc)
+             if capturing:
++                # Only Python forward reads these layer attributes. Native
++                # replay retains the captured tensor addresses in its entry;
++                # the per-entry buffer map owns their storage until clear.
++                self._attach_buffers(desc)
+                 self.last_capture_attempted = True
+                 self.capture_attempts += 1
+                 self.graph_pool = inputs.pool
+@@ -1333,7 +1401,8 @@ class DFlashProposalCUDAGraphWrapper(DFlashDrafterCUDAGraphWrapper):
+                 self._discard(desc)
+             raise
+         finally:
+-            self._detach_buffers()
++            if capturing:
++                self._detach_buffers()
+             self.graph_pool = None
+             (
+                 ctx.attn_metadata,

@@ -1,0 +1,95 @@
+diff --git a/profile_dflash2_proposal.py b/profile_dflash2_proposal.py
+index 28b7367..ad7b0f1 100644
+--- a/profile_dflash2_proposal.py
++++ b/profile_dflash2_proposal.py
+@@ -414,6 +414,12 @@ class ProposalProfiler:
+                         "proposer_class": f"{type(drafter).__module__}.{type(drafter).__name__}",
+                         "draft_class": f"{type(drafter.model).__module__}.{type(drafter.model).__name__}",
+                         "num_speculative_tokens": drafter.num_speculative_tokens,
++                        "query_start_loc_policy": (
++                            "static_dflash2"
++                            if getattr(drafter, "_dflash_query_start_loc_cpu", None)
++                            is not None
++                            else "per_step"
++                        ),
+                         "causal": drafter.dflash_causal,
+                         "full_graph_wrapper": isinstance(
+                             drafter.model, graph_module.DFlashDrafterCUDAGraphWrapper
+diff --git a/v1/sample/spec_decode/dflash.py b/v1/sample/spec_decode/dflash.py
+index ad3563a..d715b77 100644
+--- a/v1/sample/spec_decode/dflash.py
++++ b/v1/sample/spec_decode/dflash.py
+@@ -155,6 +155,15 @@ class DFlashProposer(UpstreamDFlashProposer):
+             # outside this first V1 implementation.
+             self.dflash2_num_speculative_tokens = self.num_speculative_tokens
+             query_len = 1 + self.dflash2_num_speculative_tokens
++            # Fixed K makes these prefixes immutable across batches. Keep
++            # separate storage from the runner's mutable arange buffers.
++            self._dflash_query_start_loc_buffer = (
++                self.arange[: self.max_batch_size + 1] * query_len
++            )
++            self._dflash_query_start_loc_cpu = (
++                torch.arange(self.max_batch_size + 1, dtype=torch.int32, device="cpu")
++                * query_len
++            )
+             compilation_config = self.vllm_config.compilation_config
+             max_capture_size = compilation_config.max_cudagraph_capture_size
+             if (
+@@ -642,7 +651,15 @@ class DFlashProposer(UpstreamDFlashProposer):
+             sample_indices_out=token_indices_to_sample,
+         )
+ 
+-        new_query_start_loc = self.arange[: batch_size + 1] * num_query_per_req
++        if self.is_dflash2:
++            new_query_start_loc = self._dflash_query_start_loc_buffer[: batch_size + 1]
++            new_query_start_loc_cpu = self._dflash_query_start_loc_cpu[: batch_size + 1]
++        else:
++            new_query_start_loc = self.arange[: batch_size + 1] * num_query_per_req
++            new_query_start_loc_cpu = (
++                torch.from_numpy(self.token_arange_np[: batch_size + 1]).clone()
++                * num_query_per_req
++            )
+         effective_seq_lens = self._dflash_seq_lens_buffer[:batch_size]
+         effective_seq_lens.copy_(cad.seq_lens[:batch_size])
+         if num_rejected_tokens_gpu is not None:
+@@ -665,6 +682,7 @@ class DFlashProposer(UpstreamDFlashProposer):
+         new_seq_lens_cpu_upper_bound = (
+             seq_lens_cpu_upper_bound[:batch_size] + num_query_per_req
+         )
++        max_seq_len = int(new_seq_lens_cpu_upper_bound.max().item())
+         use_proposal_graph = (
+             self._dflash_proposal_graph is not None
+             and self._dflash2_graph_ineligibility() is None
+@@ -677,7 +695,7 @@ class DFlashProposer(UpstreamDFlashProposer):
+             capacity = cad.block_table_tensor.shape[1] * self.block_size
+             if capacity <= 0:
+                 raise ValueError("DFlash requires a nonempty KV page table")
+-            upper = int(new_seq_lens_cpu_upper_bound[:batch_size].max().item())
++            upper = max_seq_len
+             bucket = (
+                 self._dflash_proposal_graph.planning_upper_bound(capacity, upper)
+                 if use_proposal_graph
+@@ -693,20 +711,18 @@ class DFlashProposer(UpstreamDFlashProposer):
+             new_seq_lens_cpu_upper_bound = torch.full_like(
+                 new_seq_lens_cpu_upper_bound, bucket
+             )
++            max_seq_len = bucket
+         new_cad = CommonAttentionMetadata(
+             query_start_loc=new_query_start_loc,
+             seq_lens=effective_seq_lens,
+-            query_start_loc_cpu=(
+-                torch.from_numpy(self.token_arange_np[: batch_size + 1]).clone()
+-                * num_query_per_req
+-            ),
++            query_start_loc_cpu=new_query_start_loc_cpu,
+             _seq_lens_cpu=None,
+             _num_computed_tokens_cpu=None,
+             seq_lens_cpu_upper_bound=new_seq_lens_cpu_upper_bound,
+             num_reqs=cad.num_reqs,
+             num_actual_tokens=num_query_total,
+             max_query_len=num_query_per_req,
+-            max_seq_len=int(new_seq_lens_cpu_upper_bound[:batch_size].max().item()),
++            max_seq_len=max_seq_len,
+             block_table_tensor=cad.block_table_tensor,
+             slot_mapping=self._slot_mapping_buffer[:num_query_total],
+             causal=self.dflash_causal,

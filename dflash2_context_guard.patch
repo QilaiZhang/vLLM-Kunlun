@@ -1,0 +1,299 @@
+diff --git a/profile_dflash2_proposal.py b/profile_dflash2_proposal.py
+index 755e509..b35c2d4 100644
+--- a/profile_dflash2_proposal.py
++++ b/profile_dflash2_proposal.py
+@@ -37,6 +37,31 @@ def device_memory_snapshot(cuda: Any, reset_peak: bool = False) -> dict[str, Any
+         return {"available": False, "error": f"{type(error).__name__}: {error}"}
+ 
+ 
++def graph_replay_implementations(entries) -> list[dict[str, Any]]:
++    """Collect the loaded replay method outside the measured window."""
++    implementations = {}
++    for entry in entries:
++        graph = entry.cudagraph
++        if graph is None or type(graph) in implementations:
++            continue
++        cls = type(graph)
++        info = {
++            "class": f"{cls.__module__}.{cls.__qualname__}",
++            "source_file": None,
++            "source": None,
++            "source_truncated": False,
++        }
++        try:
++            info["source_file"] = inspect.getsourcefile(graph.replay)
++            source = inspect.getsource(graph.replay)
++            info["source"] = source[:8192]
++            info["source_truncated"] = len(source) > 8192
++        except (OSError, TypeError):
++            pass  # Native-only implementations need runtime source/trace.
++        implementations[cls] = info
++    return list(implementations.values())
++
++
+ @dataclass
+ class _Span:
+     name: str
+@@ -520,6 +545,7 @@ class ProposalProfiler:
+             ("run_overflow", "proposal_graph_overflow"),
+             ("graph_state", "proposal_graph_state"),
+             ("_parameters_unchanged", "proposal_parameter_check"),
++            ("_context_state_unchanged", "proposal_context_state_check"),
+             ("_attach_buffers", "proposal_buffer_attach"),
+             ("_detach_buffers", "proposal_buffer_detach"),
+             ("make_descriptor", "proposal_descriptor"),
+@@ -597,6 +623,16 @@ class ProposalProfiler:
+                         if wrapper._binding_guard is not None
+                         else "python"
+                     ),
++                    "context_guard_backend": (
++                        "torch_root_guard"
++                        if wrapper._context_state_cache is not None
++                        else "python"
++                    ),
++                    "context_guard_hits": wrapper.context_guard_hits,
++                    "context_guard_misses": wrapper.context_guard_misses,
++                    "replay_implementations": graph_replay_implementations(
++                        wrapper.concrete_cudagraph_entries.values()
++                    ),
+                     "planning_policy": "fixed_full_equivalent; geometric_across_window",
+                     "planning_state": wrapper.planning_state,
+                     "planning_counts": dict(wrapper.planning_counts),
+@@ -654,6 +690,7 @@ class ProposalProfiler:
+                 "scope": "MRV1 DFlash2 independent graphs or M5 combined context/query/tail graph; combined replay bypasses component Python calls",
+                 "proposal_graph": "proposal_graph_dispatch includes state/budget checks, staging, overflow, replay and independent output clone; all capture attempts, including captures rejected by the budget, exclude the whole proposal from stage timings; duplicate_segment_dispatches counts combined hits that also dispatched an old graph wrapper; cache/state counters include warmup and reset on clear",
+                 "proposal_dispatch_breakdown": "descriptor and host_plan_check keep full validation; offloader_sync precedes graph_submit; graph_submit is the replay API call, not device kernel duration; output_copy retains independent storage; attention_graph_signature covers both combined and legacy query paths; added nested stages change dispatch self accounting",
++                "context_state_guard": "every cache hit checks live context bindings/addresses/layout/scalars after parameter checks; context_graph_state runs on initialization or guard miss; cached counters include warmup; replay source is collected only in summary",
+             },
+         }
+ 
+diff --git a/models/qwen3_dflash2.py b/models/qwen3_dflash2.py
+index bb2ffca..c859872 100644
+--- a/models/qwen3_dflash2.py
++++ b/models/qwen3_dflash2.py
+@@ -815,6 +815,40 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
+         )
+         return metadata, tensors
+ 
++    def context_kv_graph_state_bindings(self):
++        """Live sources for the optional host guard; keep in sync with state()."""
++        model = self.model
++        rotary = model.layers[0].self_attn.rotary_emb
++        return (
++            (self, ("model", "context_kv_graph_state")),
++            (
++                model,
++                (
++                    "layers",
++                    "_attn_layers",
++                    "_hidden_norm_weight",
++                    "_fused_kv_weight",
++                    "_k_norm_weights",
++                    "_fused_kv_bias",
++                    "_num_attn_layers",
++                    "_kv_size",
++                    "_head_dim",
++                    "_num_kv_heads",
++                    "_rms_norm_eps",
++                ),
++            ),
++            (
++                rotary,
++                (
++                    "cos_sin_cache",
++                    "head_size",
++                    "is_neox_style",
++                    "_match_cos_sin_cache_dtype",
++                ),
++            ),
++            *((layer, ("impl", "kv_cache")) for layer in model._attn_layers),
++        )
++
+     def compute_candidates(
+         self, hidden_states: torch.Tensor
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+diff --git a/v1/sample/spec_decode/dflash_cudagraph.py b/v1/sample/spec_decode/dflash_cudagraph.py
+index b5c0514..12a1dcd 100644
+--- a/v1/sample/spec_decode/dflash_cudagraph.py
++++ b/v1/sample/spec_decode/dflash_cudagraph.py
+@@ -778,6 +778,8 @@ class DFlashProposalCUDAGraphWrapper(DFlashDrafterCUDAGraphWrapper):
+         self._parameter_guard = None
+         self._binding_guard = None
+         self._binding_guard_inputs = ()
++        self._context_state_cache = None
++        self.context_guard_hits = self.context_guard_misses = 0
+         self._model_state_changed = False
+         self.state_checks = self.parameter_snapshots = self.cached_rejections = 0
+         self.capture_attempts = self.post_capture_rejections = 0
+@@ -863,6 +865,8 @@ class DFlashProposalCUDAGraphWrapper(DFlashDrafterCUDAGraphWrapper):
+         self._parameter_guard = None
+         self._binding_guard = None
+         self._binding_guard_inputs = ()
++        self._context_state_cache = None
++        self.context_guard_hits = self.context_guard_misses = 0
+         self._model_state_changed = False
+         self.state_checks = self.parameter_snapshots = self.cached_rejections = 0
+         self.capture_attempts = self.post_capture_rejections = 0
+@@ -964,10 +968,23 @@ class DFlashProposalCUDAGraphWrapper(DFlashDrafterCUDAGraphWrapper):
+         self.state_checks += 1
+         if self._model_state_changed:
+             return None
++        first_snapshot = self._parameter_bindings is None
++        if not first_snapshot:
++            if self._parameter_bindings[0][0] is not self._model:
++                self._model_state_changed = True
++                return None
++            if not self._parameters_unchanged():
++                self._model_state_changed = True
++                return None
++            if (
++                self._context_state_cache is not None
++                and self._context_state_unchanged()
++            ):
++                return self._context_state_cache[-1]
+         state = self._model.context_kv_graph_state()
+         if state is None:
+             return None
+-        if self._parameter_bindings is None:
++        if first_snapshot:
+             # Keep the model traversal and signature allocation off replay.
+             # Shallow module/parameter bindings still detect replacements;
+             # tensor storage/layout checks also detect same-object .data edits.
+@@ -989,11 +1006,8 @@ class DFlashProposalCUDAGraphWrapper(DFlashDrafterCUDAGraphWrapper):
+             self._build_parameter_guard()
+             self._build_binding_guard()
+             self.parameter_snapshots += 1
+-        elif not self._parameters_unchanged():
+-            self._model_state_changed = True
+-            return None
+         metadata, tensors = state
+-        return (
++        result = (
+             metadata,
+             tuple(
+                 (t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype, t.device)
+@@ -1005,6 +1019,110 @@ class DFlashProposalCUDAGraphWrapper(DFlashDrafterCUDAGraphWrapper):
+                 for layer in self._attention_layers
+             ),
+         ), (*tensors, *self._parameter_tensors)
++        if first_snapshot:
++            self._build_context_state_guard(result, tensors)
++        return result
++
++    def _context_state_unchanged(self):
++        root, layouts, owners, tensors, _ = self._context_state_cache
++        try:
++            if root.check(
++                (self._model, self._attention_layers, owners)
++            ) and layouts.check(*tensors):
++                self.context_guard_hits += 1
++                return True
++        except (TypeError, RuntimeError):
++            pass
++        # A failed or incompatible checker must execute the full live state
++        # path. Do not reuse a stale signature or retry guard construction.
++        self.context_guard_misses += 1
++        self._context_state_cache = None
++        return False
++
++    def _build_context_state_guard(self, result, state_tensors):
++        if self._parameter_guard is None or self._binding_guard is None:
++            return
++        try:
++            from torch._dynamo.guards import GuardManagerType
++
++            bindings = self._model.context_kv_graph_state_bindings() + (
++                *((layer, ("impl",)) for layer in self._attention_layers),
++                *(
++                    (layer.impl, ("sliding_window",))
++                    for layer in self._attention_layers
++                ),
++            )
++            kind = GuardManagerType.GUARD_MANAGER
++            root = torch._C._dynamo.guards.RootGuardManager()
++            owners = tuple(owner for owner, _ in bindings)
++            tensors, seen = [], set()
++            add = self._add_guard
++
++            def guard_value(node, value):
++                if isinstance(value, torch.Tensor):
++                    add(node.add_id_match_guard, id(value))
++                    pointer = node.lambda_manager(
++                        torch.Tensor.data_ptr, "data_ptr", value.data_ptr(), kind
++                    )
++                    add(pointer.add_equals_match_guard, value.data_ptr())
++                    if id(value) not in seen:
++                        tensors.append(value)
++                        seen.add(id(value))
++                elif type(value) in (list, tuple):
++                    add(node.add_id_match_guard, id(value))
++                    add(node.add_length_check_guard, len(value))
++                    get_item = (
++                        node.list_getitem_manager
++                        if isinstance(value, list)
++                        else node.tuple_getitem_manager
++                    )
++                    for index, item in enumerate(value):
++                        guard_value(get_item(index, str(index), item, kind), item)
++                elif getattr(value, "__func__", None) is not None:
++                    for name in ("__func__", "__self__"):
++                        item = getattr(value, name)
++                        child = node.getattr_manager(name, name, item, kind)
++                        add(child.add_id_match_guard, id(item))
++                elif type(value) in (int, float, bool, str, type(None)):
++                    add(node.add_equals_match_guard, value)
++                else:
++                    add(node.add_id_match_guard, id(value))
++
++            model_node = root.tuple_getitem_manager(0, "model", self._model, kind)
++            add(model_node.add_id_match_guard, id(self._model))
++            layers_node = root.tuple_getitem_manager(
++                1, "attention_layers", self._attention_layers, kind
++            )
++            guard_value(layers_node, self._attention_layers)
++            sources = root.tuple_getitem_manager(2, "context_sources", owners, kind)
++            for index, (owner, names) in enumerate(bindings):
++                node = sources.tuple_getitem_manager(index, str(index), owner, kind)
++                for name in names:
++                    value = getattr(owner, name)
++                    guard_value(node.getattr_manager(name, name, value, kind), value)
++            # Every tensor returned by the full state path must have a live
++            # source. Unsupported/custom RoPE cache arrangements use that path.
++            if not all(id(tensor) in seen for tensor in state_tensors):
++                return
++            tensors = tuple(tensors)
++            layouts = torch._C._dynamo.guards.TensorGuards(
++                *tensors,
++                dynamic_dims_sizes=[list(t.shape) for t in tensors],
++                dynamic_dims_strides=[list(t.stride()) for t in tensors],
++            )
++            if root.check(
++                (self._model, self._attention_layers, owners)
++            ) and layouts.check(*tensors):
++                self._context_state_cache = (root, layouts, owners, tensors, result)
++        except (AttributeError, ImportError, TypeError, RuntimeError):
++            self._context_state_cache = None
++
++    @staticmethod
++    def _add_guard(method, value):
++        try:
++            method(value, [])  # PyTorch 2.9.
++        except TypeError:
++            method(value, [], None)  # Newer user_stack argument.
+ 
+     def _build_parameter_guard(self):
+         # TensorGuards is a host C++ metadata checker, not a compile or kernel
+@@ -1088,12 +1206,7 @@ class DFlashProposalCUDAGraphWrapper(DFlashDrafterCUDAGraphWrapper):
+         try:
+             from torch._dynamo.guards import GuardManagerType
+ 
+-            def add_guard(method, value):
+-                try:
+-                    method(value, [])  # PyTorch 2.9.
+-                except TypeError:
+-                    method(value, [], None)  # Newer user_stack argument.
+-
++            add_guard = self._add_guard
+             kind = GuardManagerType.GUARD_MANAGER
+             root = torch._C._dynamo.guards.RootGuardManager()
+             modules = tuple(binding[0] for binding in self._parameter_bindings)

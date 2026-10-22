@@ -7,14 +7,25 @@ the engine, resets the counters, then records deterministic generation output,
 end-to-end latency, ``GPUModelRunner._build_attention_metadata`` host time and
 the number/time of full ``GDNAttentionMetadataBuilder.build`` calls. Optional
 ``--profile-slot-mapping`` hooks also record V1 batch/group/native-entry host
-times and the actual KV cache group layout.
+times and the actual KV cache group layout. ``--profile-proposal`` adds DFlash2
+stage host total/self times, actual FULL graph paths, acceptance and memory.
+``--proposal-graph on`` enables combined context/query/selection capture;
+``--require-proposal-graph-replay`` requires replay without query-only dispatch.
+Without a combined hit, context and selection run eagerly while query execution
+follows ``--full-graph``. There are no standalone context/tail graph switches.
+``--diagnose-target-diff`` adds synchronous B1/eager logits, greedy rejection
+and first-layer GDN observations for correctness investigation only.
+``--diagnostic-gdn-state-mode shadow/repair`` isolates native GDN base-slot
+writeback with a private native replay; repair changes only the live base slot.
+Optional ``--proposal-device-events`` records stream intervals without adding
+per-stage synchronization. See dflash2_proposal_baseline.md for timing limits.
 
 Example:
 
     python ci/scripts/tests/profile_dflash2_gdn_metadata.py \
         --target-model /models/Qwen3.5-27B \
         --draft-model /models/Qwen3.5-0.8B-DFlash2 \
-        --output-dir /tmp/dflash2-gdn-baseline
+        --output-dir ./dflash2-proposal/gdn-baseline
 
 Run this script from the repository root in the same Python environment used
 for vLLM-Kunlun inference.  The Python counters require the default TP=1 and
@@ -462,6 +473,11 @@ def _run_worker(args: argparse.Namespace) -> None:
     os.environ["VLLM_KUNLUN_DRAFTER_FULL_CUDAGRAPH"] = (
         "1" if args.full_graph == "on" else "0"
     )
+    os.environ["VLLM_KUNLUN_DFLASH2_PROPOSAL_CUDAGRAPH"] = (
+        "1" if args.proposal_graph == "on" else "0"
+    )
+    if args.profile_proposal or args.diagnose_target_diff:
+        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
     # Equivalence mode needs every group to execute a full build so it can
     # compare that reference with the update path. Normal Stage-3 runs leave
     # reuse enabled unless the caller explicitly sets this emergency opt-out.
@@ -484,6 +500,23 @@ def _run_worker(args: argparse.Namespace) -> None:
         path_coverage,
     ) = _install_timing_hooks(args.verify_gdn_update)
     slot_profiler = _install_slot_mapping_hooks() if args.profile_slot_mapping else None
+    proposal_profiler = None
+    if args.profile_proposal:
+        from profile_dflash2_proposal import install_proposal_profiler
+
+        proposal_profiler = install_proposal_profiler(
+            Timings, args.proposal_device_events
+        )
+
+    target_diagnostics = None
+    if args.diagnose_target_diff:
+        import torch
+        from profile_dflash2_proposal import TargetDiffDiagnostics
+
+        target_diagnostics = TargetDiffDiagnostics(
+            torch, args.diagnostic_gdn_state_mode
+        )
+        target_diagnostics.install()
 
     import torch
     from vllm import LLM, SamplingParams
@@ -514,6 +547,10 @@ def _run_worker(args: argparse.Namespace) -> None:
             "model": args.draft_model,
             "num_speculative_tokens": args.num_speculative_tokens,
         }
+    if args.profile_proposal:
+        # LLM defaults to disable_log_stats=True, which also prevents the
+        # scheduler from constructing SpecDecodingStats for acceptance hooks.
+        llm_kwargs["disable_log_stats"] = False
     if args.max_num_batched_tokens is not None:
         llm_kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
     if args.enable_chunked_prefill:
@@ -532,16 +569,22 @@ def _run_worker(args: argparse.Namespace) -> None:
     for _ in range(args.warmup_iterations):
         llm.generate(prompts, sampling_params, use_tqdm=False)
 
-    environment = None
-    if slot_profiler is not None:
-        from profile_slot_mappings import environment_snapshot
+    # Target-only references need the same deployment identity as candidates,
+    # even when no proposal/performance hooks are installed.
+    from profile_slot_mappings import environment_snapshot
 
-        environment = environment_snapshot(torch)
-        if args.tensor_parallel_size == 1 and not slot_profiler.runtime:
-            raise RuntimeError(
-                "Slot mapping hooks did not observe a V1 runner. Confirm the "
-                "actual runner and use the V1 baseline configuration."
-            )
+    environment = environment_snapshot(torch)
+    if (
+        slot_profiler is not None
+        and args.tensor_parallel_size == 1
+        and not slot_profiler.runtime
+    ):
+        raise RuntimeError(
+            "Slot mapping hooks did not observe a V1 runner. Confirm the "
+            "actual runner and use the V1 baseline configuration."
+        )
+    if proposal_profiler is not None and not proposal_profiler.runtime:
+        raise RuntimeError("Proposal hooks did not observe an MRV1 DFlash2 drafter")
 
     # Exclude model loading, graph capture and kernel warm-up from steady-state
     # counters.  XProfiler is also narrowed to this measured region.
@@ -551,24 +594,62 @@ def _run_worker(args: argparse.Namespace) -> None:
     path_coverage.reset()
     if update_verifier is not None:
         update_verifier.reset()
+    memory = None
+    if proposal_profiler is not None:
+        from profile_dflash2_proposal import device_memory_snapshot
+
+        # A measurement-boundary barrier excludes queued warmup work. Never
+        # synchronize inside a stage, a proposal, or graph capture.
+        torch.cuda.synchronize()
+        memory = {
+            "scope": "current-device allocator counters; includes models/warmup graphs; not physical total XPU memory",
+            "before": device_memory_snapshot(torch.cuda, reset_peak=True),
+        }
     profiler = _maybe_start_xprofiler(args.xprofiler)
     if slot_profiler is not None:
         slot_profiler.start()
+    if proposal_profiler is not None:
+        proposal_profiler.start()
     iteration_ms: list[float] = []
     token_ids_by_iteration: list[list[list[int]]] = []
+    completion_by_iteration = []
     total_output_tokens = 0
     try:
-        for _ in range(args.iterations):
+        for iteration in range(args.iterations):
+            if target_diagnostics is not None:
+                target_diagnostics.start_iteration(iteration)
             start_ns = time.perf_counter_ns()
             outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
             iteration_ms.append((time.perf_counter_ns() - start_ns) / 1_000_000)
             token_ids = [list(output.outputs[0].token_ids) for output in outputs]
             token_ids_by_iteration.append(token_ids)
+            completion_by_iteration.append(
+                [
+                    {
+                        "finish_reason": output.outputs[0].finish_reason,
+                        "stop_reason": output.outputs[0].stop_reason,
+                        "prompt_tokens": len(output.prompt_token_ids or []),
+                        "output_tokens": len(output.outputs[0].token_ids),
+                    }
+                    for output in outputs
+                ]
+            )
             total_output_tokens += sum(len(ids) for ids in token_ids)
     finally:
+        if proposal_profiler is not None:
+            proposal_profiler.stop()
         if slot_profiler is not None:
             slot_profiler.stop()
+        if target_diagnostics is not None:
+            target_diagnostics.stop()
         _stop_xprofiler(profiler)
+
+    proposal_summary = None
+    if proposal_profiler is not None:
+        torch.cuda.synchronize()
+        memory["after"] = device_memory_snapshot(torch.cuda)
+        proposal_summary = proposal_profiler.summary()
+        proposal_summary["memory"] = memory
 
     slot_summary = slot_profiler.summary() if slot_profiler is not None else None
     if (
@@ -610,19 +691,24 @@ def _run_worker(args: argparse.Namespace) -> None:
                 "GDN metadata reuse expected block-table updates, but none ran"
             )
     result = {
-        "schema_version": 2,
+        "schema_version": 10,
         "git_revision": _git_revision(),
         "python": sys.version,
         "platform": platform.platform(),
         "torch_version": torch.__version__,
         "environment": environment,
-        "runtime": slot_profiler.runtime if slot_profiler is not None else None,
+        "runtime": (
+            slot_profiler.runtime
+            if slot_profiler is not None
+            else proposal_profiler.runtime if proposal_profiler is not None else None
+        ),
         "config": {
             "target_model": args.target_model,
             "draft_model": args.draft_model,
             "speculative_enabled": not args.disable_speculative,
             "async_scheduling": args.async_scheduling == "on",
             "dflash2_full_graph": args.full_graph == "on",
+            "dflash2_proposal_graph": args.proposal_graph == "on",
             "target_eager": args.target_eager,
             "tensor_parallel_size": args.tensor_parallel_size,
             "dtype": args.dtype,
@@ -643,6 +729,11 @@ def _run_worker(args: argparse.Namespace) -> None:
             "warmup_iterations": args.warmup_iterations,
             "iterations": args.iterations,
             "profile_slot_mapping": args.profile_slot_mapping,
+            "profile_proposal": args.profile_proposal,
+            "proposal_device_events": args.proposal_device_events,
+            "diagnose_target_diff": args.diagnose_target_diff,
+            "diagnostic_gdn_state_mode": args.diagnostic_gdn_state_mode,
+            "spec_stats_enabled_for_proposal": args.profile_proposal,
             "gdn_metadata_reuse_disabled": os.getenv(
                 "VLLM_KUNLUN_DISABLE_GDN_METADATA_REUSE", "0"
             ).lower()
@@ -650,6 +741,11 @@ def _run_worker(args: argparse.Namespace) -> None:
         },
         "prompts": prompts,
         "metrics": {
+            "target_diff_diagnostics": (
+                target_diagnostics.summary(token_ids_by_iteration)
+                if target_diagnostics is not None
+                else None
+            ),
             "build_attention_metadata": metadata_summary,
             "gdn_full_build": gdn_summary,
             "gdn_block_table_update": gdn_update_summary,
@@ -658,6 +754,7 @@ def _run_worker(args: argparse.Namespace) -> None:
             ),
             "gdn_metadata_paths": path_summary,
             "slot_mapping": slot_summary,
+            "proposal": proposal_summary,
             "gdn_full_builds_per_metadata_call": (
                 gdn_summary["calls"] / metadata_summary["calls"]
                 if metadata_summary["calls"]
@@ -680,7 +777,13 @@ def _run_worker(args: argparse.Namespace) -> None:
             "total_output_tokens": total_output_tokens,
         },
         "token_ids_by_iteration": token_ids_by_iteration,
+        "completion_by_iteration": completion_by_iteration,
         "notes": {
+            "target_diff_diagnostics": (
+                "Correctness-only synchronous CPU reads; wall/stage timings are not performance data"
+                if args.diagnose_target_diff
+                else None
+            ),
             "python_counter_scope": (
                 "complete for the reference TP=1 in-process configuration"
                 if args.tensor_parallel_size == 1
@@ -697,6 +800,15 @@ def _run_worker(args: argparse.Namespace) -> None:
                 "compare the same instrumented script across revisions and use "
                 "an uninstrumented run for final end-to-end performance."
             ),
+            "proposal_timing": (
+                "Host total/self use Python boundaries; sample gather includes "
+                "bookkeeping on the eager selection path. Cold query/proposal capture "
+                "proposals (including warmup) are excluded from "
+                "stage summaries, but remain in generation wall time and "
+                "acceptance. Optional events perturb dispatch and measure "
+                "stream intervals, not isolated kernels. Use XProfiler for "
+                "transfers/gaps and compare uninstrumented end-to-end runs."
+            ),
         },
     }
     output = Path(args.output)
@@ -706,6 +818,40 @@ def _run_worker(args: argparse.Namespace) -> None:
     )
     print(json.dumps(result["metrics"], indent=2))
     print(f"Baseline written to {output}")
+    if target_diagnostics is not None:
+        diagnostic = result["metrics"]["target_diff_diagnostics"]
+        if not diagnostic["events"] or diagnostic["gdn_layer"] is None:
+            raise AssertionError(
+                f"Target/GDN diagnostic hooks were not observed; see {output}"
+            )
+        if (
+            args.diagnostic_gdn_state_mode != "observe"
+            and not diagnostic["state_writeback_checks"]
+        ):
+            raise AssertionError(f"GDN state experiment did not run; see {output}")
+        target_diagnostics.uninstall()
+    # Keep diagnostics even when a requested graph never replayed.
+    if proposal_summary is not None:
+        if args.require_proposal_graph_replay:
+            if not proposal_summary["proposal_graph_paths"].get(
+                "proposal_graph_replay", 0
+            ):
+                raise AssertionError(
+                    f"Proposal graph did not replay: {proposal_summary['proposal_graph_paths']}; "
+                    f"reasons={proposal_summary['proposal_fallback_reasons']}; see {output}"
+                )
+            if proposal_summary["duplicate_segment_dispatches"]:
+                raise AssertionError(
+                    f"Combined proposal also dispatched segmented graphs; see {output}"
+                )
+        if not sum(proposal_summary["graph_paths"].values()):
+            raise AssertionError("Measured region did not execute a DFlash2 proposal")
+        if (
+            args.require_draft_graph_replay
+            and args.full_graph == "on"
+            and proposal_summary["graph_paths"].get("full_graph_replay", 0) == 0
+        ):
+            raise AssertionError("FULL graph was requested but no draft replay ran")
 
 
 def _case_name(async_scheduling: str, full_graph: str) -> str:
@@ -730,6 +876,8 @@ def _worker_command(
         values["async_scheduling"],
         "--full-graph",
         values["full_graph"],
+        "--proposal-graph",
+        values["proposal_graph"],
         "--output",
         str(result_path),
     ]
@@ -758,19 +906,34 @@ def _worker_command(
         )
     command.extend(("--dtype", values["dtype"]))
     command.extend(("--prompt-set", values.get("prompt_set", "default")))
+    command.extend(
+        (
+            "--diagnostic-gdn-state-mode",
+            values.get("diagnostic_gdn_state_mode", "observe"),
+        )
+    )
     for path in values.get("require_gdn_path", ()):
         command.extend(("--require-gdn-path", path))
     for enabled, flag in (
         (values.get("xprofiler"), "--xprofiler"),
         (values.get("profile_slot_mapping"), "--profile-slot-mapping"),
+        (values.get("profile_proposal"), "--profile-proposal"),
+        (values.get("proposal_device_events"), "--proposal-device-events"),
         (values.get("verify_gdn_update"), "--verify-gdn-update"),
         (values.get("expect_gdn_reuse"), "--expect-gdn-reuse"),
         (values.get("target_eager"), "--target-eager"),
         (values.get("disable_speculative"), "--disable-speculative"),
         (values.get("enable_chunked_prefill"), "--enable-chunked-prefill"),
+        (values.get("diagnose_target_diff"), "--diagnose-target-diff"),
+        (
+            values.get("require_proposal_graph_replay"),
+            "--require-proposal-graph-replay",
+        ),
     ):
         if enabled:
             command.append(flag)
+    if values.get("require_draft_graph_replay") and values["full_graph"] == "on":
+        command.append("--require-draft-graph-replay")
     return command
 
 
@@ -791,6 +954,8 @@ def _assert_external_reference(
     if result["prompts"] != reference.get("prompts"):
         raise AssertionError(f"{case_name}: prompts differ from external reference")
     comparable_config = (
+        "target_model",
+        "draft_model",
         "speculative_enabled",
         "async_scheduling",
         "dflash2_full_graph",
@@ -836,6 +1001,119 @@ def _assert_external_reference(
         raise AssertionError(
             f"{case_name}: token output shape differs from external reference"
         )
+
+
+def _compare_target_only(result, reference_path: Path) -> dict[str, Any]:
+    reference = json.loads(reference_path.read_text(encoding="utf-8"))
+    if (
+        reference["config"]["speculative_enabled"]
+        or not result["config"]["speculative_enabled"]
+    ):
+        raise ValueError(
+            "Target-only comparison needs a non-spec reference and a spec candidate"
+        )
+    if reference["prompts"] != result["prompts"]:
+        raise ValueError("Target-only comparison prompts differ")
+    for name in (
+        "target_model",
+        "dtype",
+        "seed",
+        "tensor_parallel_size",
+        "batch_size",
+        "max_num_seqs",
+        "max_model_len",
+        "max_tokens",
+        "warmup_iterations",
+        "iterations",
+        "target_eager",
+        "async_scheduling",
+        "diagnose_target_diff",
+        "max_num_batched_tokens",
+        "enable_chunked_prefill",
+        "cudagraph_capture_sizes",
+        "prompt_set",
+        "num_speculative_tokens",
+    ):
+        if reference["config"].get(name) != result["config"].get(name):
+            raise ValueError(f"Target-only comparison config.{name} differs")
+
+    candidate_env = result.get("environment") or {}
+    reference_env = reference.get("environment") or {}
+    for name in ("vllm", "vllm_kunlun", "kunlun_ops", "torch"):
+        actual = (
+            candidate_env.get("packages", {}).get(name, {}).get("distribution_version")
+        )
+        expected = (
+            reference_env.get("packages", {}).get(name, {}).get("distribution_version")
+        )
+        if actual is not None and expected is not None and actual != expected:
+            raise ValueError(f"Target-only comparison package {name} differs")
+    sources = candidate_env.get("runtime_sources", {})
+    for name, expected in reference_env.get("runtime_sources", {}).items():
+        if name in sources and sources[name]["sha256"] != expected["sha256"]:
+            raise ValueError(f"Target-only comparison source {name} differs")
+    native_hashes = [
+        sorted({entry["sha256"] for entry in env.get("native_libraries", {}).values()})
+        for env in (candidate_env, reference_env)
+    ]
+    if all(native_hashes) and native_hashes[0] != native_hashes[1]:
+        raise ValueError("Target-only comparison loaded libapiinfer.so differs")
+
+    def event_at(data, iteration, position):
+        diagnostic = data["metrics"].get("target_diff_diagnostics") or {}
+        for event in diagnostic.get("events", ()):
+            offset = position - event["generated_start"]
+            if event["iteration"] == iteration and 0 <= offset < len(
+                event["emitted_ids"]
+            ):
+                return {"offset_in_event": offset, "event": event}
+        return None
+
+    differences = []
+    if len(result["token_ids_by_iteration"]) != len(
+        reference["token_ids_by_iteration"]
+    ):
+        raise ValueError("Target-only comparison output iteration shapes differ")
+    for iteration, (actual_batch, expected_batch) in enumerate(
+        zip(result["token_ids_by_iteration"], reference["token_ids_by_iteration"])
+    ):
+        if len(actual_batch) != len(expected_batch):
+            raise ValueError("Target-only comparison output batch shapes differ")
+        for request, (actual, expected) in enumerate(zip(actual_batch, expected_batch)):
+            position = next(
+                (i for i, (a, b) in enumerate(zip(actual, expected)) if a != b), None
+            )
+            if position is not None or len(actual) != len(expected):
+                if position is None:
+                    position = min(len(actual), len(expected))
+                differences.append(
+                    {
+                        "iteration": iteration,
+                        "request": request,
+                        "first_difference_zero_based": position,
+                        "speculative_id": (
+                            actual[position] if position < len(actual) else None
+                        ),
+                        "target_only_id": (
+                            expected[position] if position < len(expected) else None
+                        ),
+                        "target_event": event_at(reference, iteration, position),
+                        "speculative_event": event_at(result, iteration, position),
+                    }
+                )
+    return {
+        "reference_path": str(reference_path),
+        "candidate_gdn_state_mode": result["config"].get(
+            "diagnostic_gdn_state_mode", "observe"
+        ),
+        "tokens_match": result["token_ids_by_iteration"]
+        == reference["token_ids_by_iteration"],
+        "first_differences": differences,
+        "native_library_hashes_match": (
+            native_hashes[0] == native_hashes[1] if all(native_hashes) else None
+        ),
+        "not_for_performance": True,
+    }
 
 
 def _run_matrix(args: argparse.Namespace) -> None:
@@ -892,11 +1170,28 @@ def _run_matrix(args: argparse.Namespace) -> None:
             path.stem: result["metrics"] for path, result in zip(result_paths, results)
         },
     }
+    if args.target_only_reference_dir:
+        comparisons = {
+            path.stem: _compare_target_only(
+                result, Path(args.target_only_reference_dir) / path.name
+            )
+            for path, result in zip(result_paths, results)
+        }
+        summary["target_only_comparison"] = comparisons
+        summary["all_tokens_match_target_only"] = all(
+            comparison["tokens_match"] for comparison in comparisons.values()
+        )
     summary_path = output_dir / "matrix-summary.json"
     summary_path.write_text(
         json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
     )
     print(f"\nMatrix summary written to {summary_path}")
+    if (
+        args.target_only_reference_dir
+        and not args.diagnose_target_diff
+        and not summary["all_tokens_match_target_only"]
+    ):
+        raise AssertionError(f"Output differs from target-only; see {summary_path}")
     if not summary["all_tokens_match"]:
         raise AssertionError(
             "Deterministic token output differs between baseline configurations"
@@ -926,6 +1221,7 @@ def _precision_scenarios(
         "expect_gdn_reuse": args.expect_gdn_reuse,
         "verify_gdn_update": False,
         "xprofiler": False,
+        "require_draft_graph_replay": False,
     }
     return (
         (
@@ -933,6 +1229,8 @@ def _precision_scenarios(
             common
             | {
                 "disable_speculative": True,
+                "profile_proposal": False,
+                "proposal_device_events": False,
                 "batch_size": 1,
                 "max_num_seqs": 4,
                 "async_scheduling": "off",
@@ -946,6 +1244,8 @@ def _precision_scenarios(
             common
             | {
                 "disable_speculative": True,
+                "profile_proposal": False,
+                "proposal_device_events": False,
                 "batch_size": 3,
                 "max_num_seqs": 4,
                 "async_scheduling": "off",
@@ -1057,6 +1357,7 @@ def _run_precision_suite(args: argparse.Namespace) -> None:
             "gdn_updates_per_metadata_call": result["metrics"][
                 "gdn_updates_per_metadata_call"
             ],
+            "proposal": result["metrics"].get("proposal"),
         }
 
     summary = {
@@ -1092,6 +1393,10 @@ def _parse_args() -> argparse.Namespace:
         "--reference-dir",
         help="Directory containing known-good JSON files for exact token comparison",
     )
+    parser.add_argument(
+        "--target-only-reference-dir",
+        help="Matching non-spec JSON directory for cross-mode token comparison; normal runs fail on differences, diagnostic mode only records them",
+    )
     parser.add_argument("--output", help=argparse.SUPPRESS)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
@@ -1103,6 +1408,17 @@ def _parse_args() -> argparse.Namespace:
         "--async-scheduling", choices=("off", "on", "both"), default="both"
     )
     parser.add_argument("--full-graph", choices=("off", "on", "both"), default="both")
+    parser.add_argument(
+        "--proposal-graph",
+        choices=("off", "on"),
+        default="off",
+        help="Enable combined context/query/selection graph; fallback uses eager context/selection and configured query execution",
+    )
+    parser.add_argument(
+        "--require-proposal-graph-replay",
+        action="store_true",
+        help="Require measured combined replay and zero duplicate segmented graph dispatches",
+    )
     parser.add_argument(
         "--target-eager",
         action="store_true",
@@ -1157,6 +1473,32 @@ def _parse_args() -> argparse.Namespace:
         help="Record V1 slot mapping host times, KV groups and loaded environment",
     )
     parser.add_argument(
+        "--profile-proposal",
+        action="store_true",
+        help="Record MRV1 DFlash2 host stages, graph paths, acceptance and memory (TP=1)",
+    )
+    parser.add_argument(
+        "--diagnose-target-diff",
+        action="store_true",
+        help="Correctness-only B1/eager CPU observations of logits, greedy rejection and GDN state slots",
+    )
+    parser.add_argument(
+        "--diagnostic-gdn-state-mode",
+        choices=("observe", "shadow", "repair"),
+        default="observe",
+        help="Diagnostic-only GDN writeback A/B: shadow runs a private native recurrence; repair also replaces live column 0 with its first candidate",
+    )
+    parser.add_argument(
+        "--proposal-device-events",
+        action="store_true",
+        help="Add current-stream events to proposal stages; requires --profile-proposal",
+    )
+    parser.add_argument(
+        "--require-draft-graph-replay",
+        action="store_true",
+        help="Fail FULL-on cases without measured draft replay; requires --profile-proposal",
+    )
+    parser.add_argument(
         "--xprofiler",
         action="store_true",
         help="Call xtorch_ops profiler start/end around measured iterations",
@@ -1178,10 +1520,75 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     args = parser.parse_args()
+    if args.proposal_graph == "on" and (
+        args.disable_speculative
+        or args.diagnose_target_diff
+        or args.precision_suite
+        or args.tensor_parallel_size != 1
+    ):
+        parser.error(
+            "--proposal-graph on needs a TP1 speculative matrix; exclude diagnostic/precision-suite"
+        )
+    if args.require_proposal_graph_replay and (
+        args.proposal_graph != "on" or not args.profile_proposal or args.target_eager
+    ):
+        parser.error(
+            "--require-proposal-graph-replay needs --proposal-graph on --profile-proposal without target-eager"
+        )
+    if args.proposal_graph == "on" and args.require_draft_graph_replay:
+        parser.error(
+            "Use --require-proposal-graph-replay for combined dispatch; query-only replay assertions apply only without the combined graph"
+        )
+    if args.diagnostic_gdn_state_mode != "observe" and (
+        not args.diagnose_target_diff or args.disable_speculative
+    ):
+        parser.error(
+            "--diagnostic-gdn-state-mode shadow/repair needs speculative --diagnose-target-diff"
+        )
+    if args.diagnose_target_diff and (
+        args.tensor_parallel_size != 1
+        or args.batch_size != 1
+        or not args.target_eager
+        or args.async_scheduling != "off"
+        or args.full_graph != "off"
+        or args.precision_suite
+        or args.xprofiler
+        or args.profile_proposal
+        or args.profile_slot_mapping
+        or args.verify_gdn_update
+        or args.max_tokens > 64
+        or args.iterations > 2
+        or args.prompt_set != "default"
+    ):
+        parser.error(
+            "--diagnose-target-diff needs B1/TP1, --target-eager, async/full off, "
+            "default prompts, max-tokens<=64, iterations<=2; exclude performance profiling/precision-suite"
+        )
+    if args.target_only_reference_dir and (
+        args.disable_speculative or args.reference_dir or args.precision_suite
+    ):
+        parser.error(
+            "--target-only-reference-dir needs a speculative matrix candidate without --reference-dir/precision-suite"
+        )
     if args.iterations < 1 or args.warmup_iterations < 0:
         parser.error("iterations must be positive and warmup-iterations non-negative")
     if args.profile_slot_mapping and args.verify_gdn_update:
         parser.error("slot mapping baseline cannot include equivalence-check syncs")
+    if args.profile_proposal and args.verify_gdn_update:
+        parser.error("proposal baseline cannot include equivalence-check syncs")
+    if args.profile_proposal and args.tensor_parallel_size != 1:
+        parser.error("--profile-proposal requires TP=1 in-process counters")
+    if args.profile_proposal and args.disable_speculative:
+        parser.error("--profile-proposal requires a DFlash2 speculative model")
+    if args.proposal_device_events and not args.profile_proposal:
+        parser.error("--proposal-device-events requires --profile-proposal")
+    if args.require_draft_graph_replay:
+        if not args.profile_proposal:
+            parser.error("--require-draft-graph-replay requires --profile-proposal")
+        if args.target_eager or args.full_graph == "off" or args.precision_suite:
+            parser.error(
+                "replay assertion requires FULL-on/both without target-eager or precision-suite"
+            )
     if args.verify_gdn_update and args.expect_gdn_reuse:
         parser.error("--verify-gdn-update and --expect-gdn-reuse are exclusive")
     if args.precision_suite and args.verify_gdn_update:

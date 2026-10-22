@@ -579,8 +579,9 @@ class KunlunAttentionMetadataBuilder:
         if buf is None or buf.numel() < num:
             buf = torch.empty(max(num, self._max_reqs + 1), dtype=dtype, device=device)
             self._buf_cache[ck] = buf
-        out = buf[:num]
-        out.copy_(src[:num], non_blocking=True)
+        out = buf if buf.numel() == num else buf[:num]
+        source = src if src.shape[0] == num else src[:num]
+        out.copy_(source, non_blocking=True)
         return out
 
     def _init_reorder_batch_threshold(
@@ -696,9 +697,14 @@ class KunlunAttentionMetadataBuilder:
                 max(num_reqs + 1, self._max_reqs + 1), dtype=torch.int32, device="cpu"
             )
             self._buf_cache[ck] = buf
-        out = buf[: num_reqs + 1]
+        out = buf if buf.numel() == num_reqs + 1 else buf[: num_reqs + 1]
         out[0] = 0
-        torch.cumsum(seq_lens_cpu[:num_reqs].to(torch.int32), dim=0, out=out[1:])
+        lengths = (
+            seq_lens_cpu
+            if seq_lens_cpu.shape[0] == num_reqs
+            else seq_lens_cpu[:num_reqs]
+        )
+        torch.cumsum(lengths.to(torch.int32), dim=0, out=out[1:])
         return out
 
     def _staged_kv_lod_xpu(self, seq_lens: torch.Tensor, num_reqs: int) -> torch.Tensor:
@@ -712,9 +718,10 @@ class KunlunAttentionMetadataBuilder:
                 device=self.device,
             )
             self._buf_cache[ck] = buf
-        out = buf[: num_reqs + 1]
+        out = buf if buf.numel() == num_reqs + 1 else buf[: num_reqs + 1]
         out[0].zero_()
-        torch.cumsum(seq_lens[:num_reqs], dim=0, dtype=torch.int32, out=out[1:])
+        lengths = seq_lens if seq_lens.shape[0] == num_reqs else seq_lens[:num_reqs]
+        torch.cumsum(lengths, dim=0, dtype=torch.int32, out=out[1:])
         return out
 
     def build(

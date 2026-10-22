@@ -1,0 +1,172 @@
+diff --git a/profile_dflash2_proposal.py b/profile_dflash2_proposal.py
+index 98c41dc..755e509 100644
+--- a/profile_dflash2_proposal.py
++++ b/profile_dflash2_proposal.py
+@@ -440,7 +440,8 @@ class ProposalProfiler:
+ 
+         @functools.wraps(original_signature)
+         def signature(*args, **kwargs):
+-            result = original_signature(*args, **kwargs)
++            with self.stage("attention_graph_signature"):
++                result = original_signature(*args, **kwargs)
+             proposal = getattr(self._local, "proposal", None)
+             if proposal is not None and result is None:
+                 proposal.fallback_reason = "metadata_ineligible"
+@@ -521,10 +522,22 @@ class ProposalProfiler:
+             ("_parameters_unchanged", "proposal_parameter_check"),
+             ("_attach_buffers", "proposal_buffer_attach"),
+             ("_detach_buffers", "proposal_buffer_detach"),
++            ("make_descriptor", "proposal_descriptor"),
++            ("sync_offloader", "proposal_offloader_sync"),
++            ("replay_graph", "proposal_graph_submit"),
+         ):
+             self._patch(
+                 proposal_cls, name, self.wrap_stage(stage, getattr(proposal_cls, name))
+             )
++        for name, stage in (
++            ("_host_metadata_matches", "proposal_host_plan_check"),
++            ("copy_output", "proposal_output_copy"),
++        ):
++            self._patch(
++                proposal_cls,
++                name,
++                staticmethod(self.wrap_stage(stage, getattr(proposal_cls, name))),
++            )
+ 
+     def summary(self) -> dict[str, Any]:
+         # Caller synchronizes once after stop(), never per stage or inside a graph.
+@@ -640,6 +653,7 @@ class ProposalProfiler:
+                 "graph_evidence": "graph_paths/context_graph_paths/tail_graph_paths/proposal_graph_paths record software wrapper/API dispatch; they do not prove native device graph launches or backend capture coverage; validate with runtime trace",
+                 "scope": "MRV1 DFlash2 independent graphs or M5 combined context/query/tail graph; combined replay bypasses component Python calls",
+                 "proposal_graph": "proposal_graph_dispatch includes state/budget checks, staging, overflow, replay and independent output clone; all capture attempts, including captures rejected by the budget, exclude the whole proposal from stage timings; duplicate_segment_dispatches counts combined hits that also dispatched an old graph wrapper; cache/state counters include warmup and reset on clear",
++                "proposal_dispatch_breakdown": "descriptor and host_plan_check keep full validation; offloader_sync precedes graph_submit; graph_submit is the replay API call, not device kernel duration; output_copy retains independent storage; attention_graph_signature covers both combined and legacy query paths; added nested stages change dispatch self accounting",
+             },
+         }
+ 
+diff --git a/v1/sample/spec_decode/dflash_cudagraph.py b/v1/sample/spec_decode/dflash_cudagraph.py
+index 87773b1..b5c0514 100644
+--- a/v1/sample/spec_decode/dflash_cudagraph.py
++++ b/v1/sample/spec_decode/dflash_cudagraph.py
+@@ -152,6 +152,12 @@ class DFlashContextCUDAGraphWrapper(CUDAGraphWrapper):
+ 
+     def stage_inputs(self, inputs, hidden_states, positions, slots) -> None:
+         capacity = inputs.hidden_states.shape[0]
++        if hidden_states.shape[0] == capacity:
++            # The common full-capacity case needs no source/destination views.
++            inputs.hidden_states.copy_(hidden_states)
++            inputs.positions.copy_(positions)
++            inputs.slots.copy_(slots)
++            return
+         count = min(capacity, hidden_states.shape[0])
+         inputs.hidden_states[:count].copy_(hidden_states[:count])
+         inputs.positions[:count].copy_(positions[:count])
+@@ -728,6 +734,7 @@ class _DFlashProposalInputs:
+     host_checks: tuple[tuple[str, str, torch.Tensor], ...] = ()
+     device_copies: tuple[tuple[str, str, torch.Tensor], ...] = ()
+     charged_bytes: int = 0
++    capture_slot_mapping: dict[str, torch.Tensor] | None = None
+ 
+ 
+ class DFlashProposalCUDAGraphWrapper(DFlashDrafterCUDAGraphWrapper):
+@@ -1149,6 +1156,30 @@ class DFlashProposalCUDAGraphWrapper(DFlashDrafterCUDAGraphWrapper):
+             * 4
+         )
+ 
++    def make_descriptor(self, batch, attention_signature, capacity, metadata, tensors):
++        return _DFlashProposalDescriptor(
++            num_tokens=tensors[3].numel(),
++            num_reqs=batch,
++            uniform=False,
++            attention_signature=attention_signature,
++            context_capacity=capacity,
++            metadata_layout=self._metadata_layout(metadata),
++            input_layout=tuple(
++                (t.dtype, t.device, tuple(t.shape[1:])) for t in tensors
++            ),
++        )
++
++    def sync_offloader(self):
++        get_offloader().sync_prev_onload()
++
++    def replay_graph(self, entry):
++        entry.cudagraph.replay()
++
++    @staticmethod
++    def copy_output(output):
++        # Each caller owns its result across subsequent replay and clear.
++        return output.clone()
++
+     def __call__(
+         self,
+         context,
+@@ -1210,24 +1241,12 @@ class DFlashProposalCUDAGraphWrapper(DFlashDrafterCUDAGraphWrapper):
+             or context_slots.shape != context_positions.shape
+         ):
+             raise ValueError("Invalid DFlash2 proposal graph inputs")
+-        desc = _DFlashProposalDescriptor(
+-            num_tokens=ids.numel(),
+-            num_reqs=batch,
+-            uniform=False,
+-            attention_signature=attention_signature,
+-            context_capacity=capacity,
+-            metadata_layout=self._metadata_layout(ctx.attn_metadata),
+-            input_layout=tuple(
+-                (t.dtype, t.device, tuple(t.shape[1:]))
+-                for t in (
+-                    context,
+-                    context_positions,
+-                    context_slots,
+-                    ids,
+-                    positions,
+-                    samples,
+-                )
+-            ),
++        desc = self.make_descriptor(
++            batch,
++            attention_signature,
++            capacity,
++            ctx.attn_metadata,
++            (context, context_positions, context_slots, ids, positions, samples),
+         )
+         reason = self._rejected_descriptors.get(desc)
+         if reason:
+@@ -1300,6 +1319,9 @@ class DFlashProposalCUDAGraphWrapper(DFlashDrafterCUDAGraphWrapper):
+                 current_platform.graph_pool_handle(),
+                 host_checks,
+                 device_copies,
++                capture_slot_mapping={
++                    name: md.slot_mapping for name, md in staged_metadata.items()
++                },
+             )
+             for md in {id(m): m for m in staged_metadata.values()}.values():
+                 md.slot_mapping.fill_(PAD_SLOT_ID)
+@@ -1315,9 +1337,7 @@ class DFlashProposalCUDAGraphWrapper(DFlashDrafterCUDAGraphWrapper):
+             ctx.skip_compiled,
+         )
+         ctx.attn_metadata = inputs.metadata
+-        ctx.slot_mapping = {
+-            name: md.slot_mapping for name, md in inputs.metadata.items()
+-        }
++        ctx.slot_mapping = inputs.capture_slot_mapping
+         ctx.batch_descriptor, ctx.cudagraph_runtime_mode, ctx.skip_compiled = (
+             desc,
+             CUDAGraphMode.FULL,
+@@ -1387,15 +1407,15 @@ class DFlashProposalCUDAGraphWrapper(DFlashDrafterCUDAGraphWrapper):
+             )
+             if context.shape[0] > capacity:
+                 self.run_overflow(context, context_positions, context_slots, capacity)
+-            get_offloader().sync_prev_onload()
+-            entry.cudagraph.replay()
++            self.sync_offloader()
++            self.replay_graph(entry)
+             self.last_path = (
+                 "proposal_graph_capture" if capturing else "proposal_graph_replay"
+             )
+             self.last_capacity, self.last_overflow = capacity, max(
+                 0, context.shape[0] - capacity
+             )
+-            return entry.output.clone()
++            return self.copy_output(entry.output)
+         except BaseException:
+             if capturing:
+                 self._discard(desc)

@@ -78,6 +78,27 @@ def environment_snapshot(torch: Any) -> dict[str, Any]:
         and getattr(module, "__file__", "")
         and Path(module.__file__).suffix in (".so", ".pyd")
     }
+    native_libraries = {}
+    maps = Path("/proc/self/maps")
+    if maps.is_file():
+        for line in maps.read_text(encoding="utf-8").splitlines():
+            fields = line.split(maxsplit=5)
+            if len(fields) != 6:
+                continue
+            source = Path(fields[-1])
+            if source.name != "libapiinfer.so" or not source.is_file():
+                continue
+            key = str(source.resolve())
+            if key not in native_libraries:
+                digest = hashlib.sha256()
+                with source.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                native_libraries[key] = {
+                    "observed_in_process_maps": True,
+                    "size_bytes": source.stat().st_size,
+                    "sha256": digest.hexdigest(),
+                }
     devices = []
     for index in range(torch.cuda.device_count()):
         props = torch.cuda.get_device_properties(index)
@@ -88,11 +109,37 @@ def environment_snapshot(torch: Any) -> dict[str, Any]:
                 "total_memory_bytes": props.total_memory,
             }
         )
+    runtime_sources = {}
+    for name in (
+        "vllm_kunlun.v1.sample.spec_decode.dflash",
+        "vllm_kunlun.v1.sample.spec_decode.dflash_cudagraph",
+        "vllm_kunlun.models.qwen3_dflash2",
+        "vllm_kunlun.v1.attention.backends.kunlun_attn",
+        "vllm_kunlun.registration.compat_patches",
+        "vllm.v1.spec_decode.llm_base_proposer",
+        "vllm.compilation.cuda_graph",
+        "vllm_kunlun.models.qwen3_5",
+        "vllm_kunlun.models.qwen3_next",
+        "vllm_kunlun.v1.attention.backends.gdn_attn",
+        "vllm_kunlun.ops.fla.fused_recurrent",
+        "vllm_kunlun.ops.mamba.causal_conv1d",
+        "vllm_kunlun.v1.worker.mamba_utils",
+        "vllm.v1.sample.rejection_sampler",
+        "vllm.v1.sample.sampler",
+    ):
+        source = getattr(sys.modules.get(name), "__file__", None)
+        if source and Path(source).is_file():
+            runtime_sources[name] = {
+                "source": source,
+                "sha256": hashlib.sha256(Path(source).read_bytes()).hexdigest(),
+            }
     return {
         "hostname": platform.node(),
         "python_executable": sys.executable,
         "packages": packages,
         "native_modules": native_modules,
+        "native_libraries": native_libraries,
+        "runtime_sources": runtime_sources,
         "profiling_script_sha256": {
             name: hashlib.sha256(
                 Path(__file__).with_name(name).read_bytes()
@@ -100,7 +147,9 @@ def environment_snapshot(torch: Any) -> dict[str, Any]:
             for name in (
                 "profile_dflash2_gdn_metadata.py",
                 "profile_slot_mappings.py",
+                "profile_dflash2_proposal.py",
             )
+            if Path(__file__).with_name(name).is_file()
         },
         "devices": devices,
         "execution_environment": {
@@ -112,6 +161,8 @@ def environment_snapshot(torch: Any) -> dict[str, Any]:
                 "VLLM_USE_V2_MODEL_RUNNER",
                 "VLLM_ENABLE_V1_MULTIPROCESSING",
                 "VLLM_KUNLUN_DRAFTER_FULL_CUDAGRAPH",
+                "VLLM_KUNLUN_DFLASH2_PROPOSAL_CUDAGRAPH",
+                "VLLM_KUNLUN_DFLASH2_PROPOSAL_CUDAGRAPH_MAX_ENTRIES",
                 "VLLM_KUNLUN_DISABLE_GDN_METADATA_REUSE",
                 "XMLIR_FORCE_USE_XPU_GRAPH",
                 "XMLIR_ENABLE_MOCK_TORCH_COMPILE",

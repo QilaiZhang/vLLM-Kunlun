@@ -1,0 +1,385 @@
+diff --git a/profile_dflash2_gdn_metadata.py b/profile_dflash2_gdn_metadata.py
+index dba62d0..23c5425 100644
+--- a/profile_dflash2_gdn_metadata.py
++++ b/profile_dflash2_gdn_metadata.py
+@@ -691,7 +691,7 @@ def _run_worker(args: argparse.Namespace) -> None:
+                 "GDN metadata reuse expected block-table updates, but none ran"
+             )
+     result = {
+-        "schema_version": 9,
++        "schema_version": 10,
+         "git_revision": _git_revision(),
+         "python": sys.version,
+         "platform": platform.platform(),
+diff --git a/profile_dflash2_proposal.py b/profile_dflash2_proposal.py
+index e05dda4..a95f5d4 100644
+--- a/profile_dflash2_proposal.py
++++ b/profile_dflash2_proposal.py
+@@ -430,8 +430,8 @@ class ProposalProfiler:
+                         "proposal_graph_max_entries": (
+                             combined.max_entries if combined is not None else None
+                         ),
+-                        "proposal_graph_max_bytes": (
+-                            combined.max_bytes if combined is not None else None
++                        "proposal_graph_pool_policy": (
++                            "upstream_global" if combined is not None else None
+                         ),
+                     }
+                 )
+@@ -507,7 +507,6 @@ class ProposalProfiler:
+             ("stage_inputs", "proposal_graph_staging"),
+             ("run_overflow", "proposal_graph_overflow"),
+             ("prepare_capture", "proposal_capture_prepare"),
+-            ("_admit_capture", "proposal_capture_admission"),
+             ("_create_inputs", "proposal_capture_inputs"),
+             ("_capture_entry", "proposal_capture_entry"),
+             ("_attach_buffers", "proposal_buffer_attach"),
+@@ -558,23 +557,12 @@ class ProposalProfiler:
+             "proposal_graph_cache": [
+                 {
+                     "entries": len(wrapper._inputs),
+-                    "charged_bytes": wrapper.charged_bytes,
+                     "max_entries": wrapper.max_entries,
+-                    "max_bytes": wrapper.max_bytes,
+-                    "budget_rejected_entries": sum(
+-                        reason in ("memory_budget", "captured_memory_budget")
+-                        for reason in wrapper._rejected_descriptors.values()
+-                    ),
+-                    "rejected_entries_by_reason": dict(
+-                        Counter(wrapper._rejected_descriptors.values())
+-                    ),
+                     "generation": wrapper.generation,
+                     "last_clear_reason": wrapper.last_clear_reason,
+                     "capture_preparations": wrapper.capture_preparations,
+                     "captured_tensor_count": len(wrapper._capture_tensors or ()),
+-                    "cached_rejections": wrapper.cached_rejections,
+                     "capture_attempts": wrapper.capture_attempts,
+-                    "post_capture_rejections": wrapper.post_capture_rejections,
+                     "state_policy": "fixed_dependencies_explicit_invalidation",
+                     "replay_implementations": graph_replay_implementations(
+                         wrapper.concrete_cudagraph_entries.values()
+@@ -591,7 +579,7 @@ class ProposalProfiler:
+                         }
+                         for desc in wrapper._inputs
+                     ],
+-                    "budget_policy": "input_estimate_then_observed_capture_delta",
++                    "pool_policy": "upstream_global",
+                 }
+                 for wrapper in self._proposal_wrappers
+             ],
+@@ -632,7 +620,7 @@ class ProposalProfiler:
+                 "context": "context_precompute measures eager model precompute; combined replay bypasses it, and proposal_graph_overflow measures extra rows outside the fixed-capacity graph",
+                 "graph_evidence": "graph_paths/proposal_graph_paths record software wrapper/API dispatch; they do not prove native device graph launches or backend capture coverage; validate with runtime trace",
+                 "scope": "MRV1 DFlash2 combined context/query/selection graph or eager context/selection with configured query execution; no standalone context/tail graphs",
+-                "proposal_graph": "proposal_graph_dispatch includes dynamic eligibility/metadata checks, cold admission/capture, staging, overflow, replay and independent output clone; all capture attempts, including captures rejected by the budget, exclude the whole proposal from stage timings; duplicate_segment_dispatches counts combined hits that also dispatched the query-only graph wrapper; cache/capture counters include warmup and reset on clear; generation increases on clear",
++                "proposal_graph": "proposal_graph_dispatch includes dynamic eligibility/metadata checks, cold capture, staging, overflow, replay and independent output clone; all capture attempts exclude the whole proposal from stage timings; duplicate_segment_dispatches counts combined hits that also dispatched the query-only graph wrapper; cache/capture counters include warmup and reset on clear; generation increases on clear",
+                 "proposal_dispatch_breakdown": "descriptor and host_plan_check keep full validation; offloader_sync precedes graph_submit; graph_submit is the replay API call, not device kernel duration; output_copy retains independent storage; attention_graph_signature covers both combined and legacy query paths; added nested stages change dispatch self accounting",
+                 "graph_lifecycle": "model/KV/RoPE dependencies stay fixed between explicit clear boundaries; capture preparation holds tensors once per generation, never scans model parameters on replay; runner/worker hooks invalidate before and after resource changes; direct external changes must clear at a quiescent boundary",
+                 "slow_proposals": "up to 3 slowest successful non-capture proposals, with all existing spans from the same call; ordinal includes successful cold proposals since start(); inclusive nested spans are not additive; serialization runs in summary without new device synchronization",
+diff --git a/profile_slot_mappings.py b/profile_slot_mappings.py
+index 8b6d329..227242f 100644
+--- a/profile_slot_mappings.py
++++ b/profile_slot_mappings.py
+@@ -163,7 +163,6 @@ def environment_snapshot(torch: Any) -> dict[str, Any]:
+                 "VLLM_KUNLUN_DRAFTER_FULL_CUDAGRAPH",
+                 "VLLM_KUNLUN_DFLASH2_PROPOSAL_CUDAGRAPH",
+                 "VLLM_KUNLUN_DFLASH2_PROPOSAL_CUDAGRAPH_MAX_ENTRIES",
+-                "VLLM_KUNLUN_DFLASH2_PROPOSAL_CUDAGRAPH_MAX_BYTES",
+                 "VLLM_KUNLUN_DISABLE_GDN_METADATA_REUSE",
+                 "XMLIR_FORCE_USE_XPU_GRAPH",
+                 "XMLIR_ENABLE_MOCK_TORCH_COMPILE",
+diff --git a/v1/sample/spec_decode/dflash.py b/v1/sample/spec_decode/dflash.py
+index 36a5e85..a4b58af 100644
+--- a/v1/sample/spec_decode/dflash.py
++++ b/v1/sample/spec_decode/dflash.py
+@@ -252,9 +252,8 @@ class DFlashProposer(UpstreamDFlashProposer):
+             )
+             logger.info(
+                 "DFlash2 proposal graph enabled (FP16/TP1/K3): max_entries=%d, "
+-                "max_bytes=%d; fallback uses eager context/selection and configured query execution",
++                "pool=global; fallback uses eager context/selection and configured query execution",
+                 self._dflash_proposal_graph.max_entries,
+-                self._dflash_proposal_graph.max_bytes,
+             )
+         if (
+             self.is_dflash2
+diff --git a/v1/sample/spec_decode/dflash_cudagraph.py b/v1/sample/spec_decode/dflash_cudagraph.py
+index 42e9048..537d042 100644
+--- a/v1/sample/spec_decode/dflash_cudagraph.py
++++ b/v1/sample/spec_decode/dflash_cudagraph.py
+@@ -23,7 +23,6 @@ from vllm.forward_context import (
+ )
+ from vllm.logger import init_logger
+ from vllm.model_executor.offloader.base import get_offloader
+-from vllm.platforms import current_platform
+ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+
+ logger = init_logger(__name__)
+@@ -285,10 +284,8 @@ class _DFlashProposalInputs:
+     positions: torch.Tensor
+     sample_indices: torch.Tensor
+     metadata: dict[str, Any]
+-    pool: Any
+     host_checks: tuple[tuple[str, str, torch.Tensor], ...] = ()
+     device_copies: tuple[tuple[str, str, torch.Tensor], ...] = ()
+-    charged_bytes: int = 0
+     capture_slot_mapping: dict[str, torch.Tensor] | None = None
+
+
+@@ -298,7 +295,7 @@ class DFlashProposalCUDAGraphWrapper(_DFlashCUDAGraphWrapper):
+     Returning None always precedes live KV writes: the proposer can then run
+     its original first pass exactly once. Capture errors propagate, including
+     OOM; they are never swallowed and retried on potentially modified state.
+-    Each entry owns a pool so rejecting an over-budget capture can release it.
++    Entries share the upstream global graph pool; capture failures propagate.
+     """
+
+     def __init__(self, model, tail, returns_tuple, vllm_config, device, query_len):
+@@ -307,7 +304,6 @@ class DFlashProposalCUDAGraphWrapper(_DFlashCUDAGraphWrapper):
+         self._returns_tuple = returns_tuple
+         self.runnable = self._run_proposal
+         self.cudagraph_options = CUDAGraphOptions(weak_ref_output=False)
+-        self.graph_pool = None
+         # Actual B and attention planning buckets both contribute entries.
+         default_entries = _max_dflash_graph_entries(vllm_config, query_len) * max(
+             1, vllm_config.model_config.max_model_len.bit_length()
+@@ -317,11 +313,8 @@ class DFlashProposalCUDAGraphWrapper(_DFlashCUDAGraphWrapper):
+                 "VLLM_KUNLUN_DFLASH2_PROPOSAL_CUDAGRAPH_MAX_ENTRIES", default_entries
+             )
+         )
+-        self.max_bytes = int(
+-            os.getenv("VLLM_KUNLUN_DFLASH2_PROPOSAL_CUDAGRAPH_MAX_BYTES", 256 * 1024**2)
+-        )
+-        if self.max_entries < 1 or self.max_bytes < 1:
+-            raise ValueError("DFlash2 proposal graph limits must be positive")
++        if self.max_entries < 1:
++            raise ValueError("DFlash2 proposal graph entry limit must be positive")
+         self.generation = 0
+         self.clear_graphs()
+
+@@ -380,14 +373,11 @@ class DFlashProposalCUDAGraphWrapper(_DFlashCUDAGraphWrapper):
+         if (reason, num_reqs) not in self._reported_fallbacks:
+             self._reported_fallbacks.add((reason, num_reqs))
+             logger.info(
+-                "DFlash2 proposal graph fallback: reason=%s B=%d entries=%d/%d "
+-                "charged_bytes=%d/%d",
++                "DFlash2 proposal graph fallback: reason=%s B=%d entries=%d/%d",
+                 reason,
+                 num_reqs,
+                 len(self._inputs),
+                 self.max_entries,
+-                self.charged_bytes,
+-                self.max_bytes,
+             )
+
+     def clear_graphs(self):
+@@ -395,11 +385,9 @@ class DFlashProposalCUDAGraphWrapper(_DFlashCUDAGraphWrapper):
+         super().clear_graphs()
+         self._inputs = {}
+         self._reported_fallbacks = set()
+-        self._rejected_descriptors = {}
+-        self.graph_pool = self._stream_id = self._capture_tensors = None
+-        self.charged_bytes = 0
+-        self.capture_preparations = self.cached_rejections = 0
+-        self.capture_attempts = self.post_capture_rejections = 0
++        self._stream_id = self._capture_tensors = None
++        self.capture_preparations = 0
++        self.capture_attempts = 0
+         self.planning_state, self.planning_counts = None, {}
+         self.generation += 1
+         self.last_clear_reason = "clear_graphs"
+@@ -500,34 +488,6 @@ class DFlashProposalCUDAGraphWrapper(_DFlashCUDAGraphWrapper):
+             self.capture_preparations += 1
+         return True
+
+-    def _minimum_bytes(self, desc, context, ids, positions, samples, metadata):
+-        staged = context.element_size() * desc.context_capacity * context.shape[1]
+-        staged += 16 * desc.context_capacity  # int64 context positions/slots
+-        staged += sum(t.numel() * t.element_size() for t in (ids, positions, samples))
+-        staged += sum(
+-            v.numel() * v.element_size()
+-            for md in {id(m): m for m in metadata.values()}.values()
+-            for v in vars(md).values()
+-            if isinstance(v, torch.Tensor)
+-        )
+-        staged += sum(
+-            2
+-            * desc.num_tokens
+-            * layer.num_heads
+-            * layer.head_size_v
+-            * context.element_size()
+-            for layer in self._attention_layers
+-        )
+-        # Conservative float32 logit workspace; native allocations may exceed
+-        # this estimate. Post-capture charging is also required, before replay.
+-        return (
+-            staged
+-            + desc.num_reqs
+-            * (self._query_len - 1)
+-            * self._model.lm_head.weight.shape[0]
+-            * 4
+-        )
+-
+     def make_descriptor(self, batch, attention_signature, capacity, metadata, tensors):
+         return _DFlashProposalDescriptor(
+             num_tokens=tensors[3].numel(),
+@@ -552,32 +512,6 @@ class DFlashProposalCUDAGraphWrapper(_DFlashCUDAGraphWrapper):
+         # Each caller owns its result across subsequent replay and clear.
+         return output.clone()
+
+-    def _admit_capture(self, desc, context, ids, positions, samples, metadata):
+-        reason = self._rejected_descriptors.get(desc)
+-        if reason:
+-            self.cached_rejections += 1
+-            self.record_fallback(reason, desc.num_reqs)
+-            return None
+-        estimate = self._minimum_bytes(desc, context, ids, positions, samples, metadata)
+-        if len(self._inputs) >= self.max_entries:
+-            reason = "entry_limit"
+-        elif self.charged_bytes + estimate > self.max_bytes:
+-            reason = "memory_budget"
+-        if reason:
+-            self._rejected_descriptors[desc] = reason
+-        else:
+-            try:
+-                free, _ = torch.cuda.mem_get_info(self._device)
+-                if free < estimate:
+-                    reason = "insufficient_device_memory"
+-            except (AttributeError, NotImplementedError, RuntimeError):
+-                reason = "memory_stats_unavailable"
+-        if reason:
+-            # Transient free-memory failures are not negative-cached.
+-            self.record_fallback(reason, desc.num_reqs)
+-            return None
+-        return estimate
+-
+     def _create_inputs(
+         self,
+         desc,
+@@ -600,7 +534,6 @@ class DFlashProposalCUDAGraphWrapper(_DFlashCUDAGraphWrapper):
+             positions.clone(),
+             samples.clone(),
+             staged,
+-            current_platform.graph_pool_handle(),
+             host,
+             device,
+             capture_slot_mapping={name: md.slot_mapping for name, md in staged.items()},
+@@ -609,8 +542,8 @@ class DFlashProposalCUDAGraphWrapper(_DFlashCUDAGraphWrapper):
+             md.slot_mapping.fill_(PAD_SLOT_ID)
+         return inputs
+
+-    def _capture_entry(self, desc, inputs, estimate, before):
+-        """Cold, KV-inert warmup/capture; publish only an admitted entry."""
++    def _capture_entry(self, desc, inputs):
++        """Cold, KV-inert warmup/capture in the inherited global pool."""
+         ctx = get_forward_context()
+         original = (
+             ctx.attn_metadata,
+@@ -640,28 +573,12 @@ class DFlashProposalCUDAGraphWrapper(_DFlashCUDAGraphWrapper):
+                 True,
+             )
+             self._attach_buffers(desc)
+-            self.graph_pool = inputs.pool
+             self.runnable(*args)  # All context/query slots are PAD.
+             entry = _capture_dflash_graph(self, desc, args)
+-            charge = max(
+-                estimate,
+-                torch.cuda.memory_allocated(self._device) - before[0],
+-                torch.cuda.memory_reserved(self._device) - before[1],
+-            )
+-            if self.charged_bytes + charge > self.max_bytes:
+-                self.post_capture_rejections += 1
+-                self._discard(desc)
+-                self._rejected_descriptors[desc] = "captured_memory_budget"
+-                self.record_fallback("captured_memory_budget", desc.num_reqs)
+-                return None
+-            inputs.charged_bytes = charge
+-            self.charged_bytes += charge
+             self._inputs[desc] = inputs
+             logger.info(
+-                "Captured DFlash2 proposal graph: %s bytes=%d/%d backend=%s.%s",
++                "Captured DFlash2 proposal graph: %s pool=global backend=%s.%s",
+                 desc,
+-                self.charged_bytes,
+-                self.max_bytes,
+                 type(entry.cudagraph).__module__,
+                 type(entry.cudagraph).__qualname__,
+             )
+@@ -671,7 +588,6 @@ class DFlashProposalCUDAGraphWrapper(_DFlashCUDAGraphWrapper):
+             raise
+         finally:
+             self._detach_buffers()
+-            self.graph_pool = None
+             (
+                 ctx.attn_metadata,
+                 ctx.slot_mapping,
+@@ -750,18 +666,18 @@ class DFlashProposalCUDAGraphWrapper(_DFlashCUDAGraphWrapper):
+         )
+         inputs = self._inputs.get(desc)
+         capturing = inputs is None
++        staging_metadata = ctx.attn_metadata
+         if capturing:
+-            estimate = self._admit_capture(
+-                desc, context, ids, positions, samples, ctx.attn_metadata
+-            )
+-            if estimate is None:
++            if len(self._inputs) >= self.max_entries:
++                self.record_fallback("entry_limit", batch)
+                 return None
+             if not self.prepare_capture():
+                 self.record_fallback("model_state_unavailable", batch)
+                 return None
+-            before = (
+-                torch.cuda.memory_allocated(self._device),
+-                torch.cuda.memory_reserved(self._device),
++            # A cold capture may reuse the target graph's pool allocations.
++            # Preserve live context (including overflow) before capturing.
++            context, context_positions, context_slots = (
++                t.clone() for t in (context, context_positions, context_slots)
+             )
+             inputs = self._create_inputs(
+                 desc,
+@@ -773,9 +689,22 @@ class DFlashProposalCUDAGraphWrapper(_DFlashCUDAGraphWrapper):
+                 samples,
+                 ctx.attn_metadata,
+             )
+-            entry = self._capture_entry(desc, inputs, estimate, before)
+-            if entry is None:
+-                return None
++            slots = [
++                (value, getattr(ctx.attn_metadata[name], field).clone())
++                for name, field, value in (*inputs.host_checks, *inputs.device_copies)
++                if field == "slot_mapping"
++            ]
++            entry = self._capture_entry(desc, inputs)
++            for target, source in slots:
++                target.copy_(source)
++            # Query/metadata were cloned before capture; do not reread pooled
++            # source tensors after warmup/capture. Only slot mappings used PAD.
++            ids, positions, samples = (
++                inputs.input_ids,
++                inputs.positions,
++                inputs.sample_indices,
++            )
++            staging_metadata = inputs.metadata
+             self._stream_id = stream
+         else:
+             if not self._host_metadata_matches(inputs, ctx.attn_metadata):
+@@ -793,7 +722,7 @@ class DFlashProposalCUDAGraphWrapper(_DFlashCUDAGraphWrapper):
+             ids,
+             positions,
+             samples,
+-            ctx.attn_metadata,
++            staging_metadata,
+         )
+         if context.shape[0] > capacity:
+             self.run_overflow(context, context_positions, context_slots, capacity)
+@@ -808,7 +737,5 @@ class DFlashProposalCUDAGraphWrapper(_DFlashCUDAGraphWrapper):
+
+     def _discard(self, desc):
+         self.concrete_cudagraph_entries.pop(desc, None)
+-        inputs = self._inputs.pop(desc, None)
+-        if inputs is not None:
+-            self.charged_bytes -= inputs.charged_bytes
++        self._inputs.pop(desc, None)
+         self._attention_buffers.pop(desc, None)
