@@ -28,7 +28,7 @@ class TopKTopPSampler(nn.Module):
         super().__init__()
         self.logprobs_mode = logprobs_mode
         self.use_fp64_gumbel = use_fp64_gumbel
-        logger.info_once("Using FlashInfer for top-p & top-k sampling.")
+        logger.info_once("Using kunlun_ops.fused_sort_cdf sampling filter.")
         self.forward = self.forward_kunlun
         self.apply_top_k_top_p = apply_top_k_top_p
 
@@ -53,140 +53,32 @@ class TopKTopPSampler(nn.Module):
         probs = logits.softmax(dim=-1, dtype=torch.float32)
         return random_sample(probs, generators), logits_to_return
 
-    def forward_kunlun(
-        self,
-        logits: torch.Tensor,
-        generators: dict[int, torch.Generator],
-        k: torch.Tensor | None,
-        p: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """More optimized implementation for top-k and top-p sampling."""
-        if (k is None and p is None) or generators:
-            if generators:
-                logger.debug_once(
-                    "FlashInfer 0.2.3+ does not support "
-                    "per-request generators. Falling back to "
-                    "PyTorch-native implementation."
-                )
-            return self.forward_native(logits, generators, k, p)
-        # flashinfer sampling functions expect contiguous logits.
-        # In flex_attn/triton_attn fp32 inference, logits can be non-contiguous
-        # because of slicing operation in logits_processor.
-        return flashinfer_sample(logits.contiguous(), k, p, generators), None
+    def forward_kunlun(self, logits, generators, k, p):
+        """Filter logits with the fused Kunlun operator, then sample."""
+        return self.forward_native(logits, generators, k, p)
 
 
-def apply_top_k_top_p(
-    logits: torch.Tensor,
-    k: torch.Tensor | None,
-    p: torch.Tensor | None,
-) -> torch.Tensor:
-    """Apply top-k and top-p masks to the logits.
-
-    If a top-p is used, this function will sort the logits tensor,
-    which can be slow for large batches.
-
-    The logits tensor may be updated in-place.
-    """
-    if p is None:
-        if k is None:
-            return logits
-
-        # Avoid sorting vocab for top-k only case.
-        return apply_top_k_only(logits, k)
-
-    logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
-
-    if k is not None:
-        # Apply top-k.
-        top_k_mask = logits_sort.size(1) - k.to(torch.long)  # shape: B
-        # Get all the top_k values.
-        top_k_mask = logits_sort.gather(1, top_k_mask.unsqueeze(dim=1))
-        top_k_mask = logits_sort < top_k_mask
-        logits_sort.masked_fill_(top_k_mask, -float("inf"))
-
-    if p is not None:
-        # Apply top-p.
-        probs_sort = logits_sort.softmax(dim=-1)
-        probs_sum = torch.cumsum(probs_sort, dim=-1, out=probs_sort)
-        top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
-        # at least one
-        top_p_mask[:, -1] = False
-        logits_sort.masked_fill_(top_p_mask, -float("inf"))
-
-    # Re-sort the probabilities.
-    logits = logits_sort.scatter(dim=-1, index=logits_idx, src=logits_sort)
-    return logits
+def apply_top_k_top_p(logits, k, p):
+    """Fused sort/CDF filter. No host reads or experiment-mode routing."""
+    if (k is None and p is None) or logits.shape[0] == 0:
+        return logits
+    if logits.dtype != torch.float32:
+        raise TypeError("fused_sort_cdf requires FP32 sampling logits")
+    batch, vocab = logits.shape
+    top_k = (torch.full((batch,), vocab, dtype=torch.int64, device=logits.device)
+             if k is None else k.to(device=logits.device, dtype=torch.int64).contiguous())
+    top_p = (torch.ones((batch,), dtype=torch.float32, device=logits.device)
+             if p is None else p.to(device=logits.device, dtype=torch.float32).contiguous())
+    return kunlun_ops.fused_sort_cdf(
+        logits.contiguous(), top_k, top_p, apply_top_p=p is not None)
 
 
-def apply_top_k_top_p_optimized(
-    logits: torch.Tensor,
-    k: torch.Tensor | None,
-    p: torch.Tensor | None,
-    max_select_k: int = 8192,
-) -> torch.Tensor:
-    """Sort-free top-k + top-p, mathematically identical to
-    :func:`apply_top_k_top_p` (same surviving token set, bit-identical probs).
 
-    Two strategies, picked by whether a small top-k window is available:
-
-    1. ``k`` given and ``max(k) <= max_select_k``: a single
-       ``topk(select_k)`` (select_k << V) yields a window that provably
-       contains every row's kept set, so top-p only needs a sorted cumsum over
-       that window. Exact, because the softmax over the window equals the
-       softmax over the full vocab once everything outside the top-k is -inf.
-    2. otherwise (``k`` is None, or top-k is effectively disabled -- vLLM
-       encodes that as ``k == vocab_size``): there is no bounded window, so use
-       ``kunlun_ops.top_p_renorm_probs``, which computes the top-p cutoff
-       without sorting.
-
-    NOTE: do NOT approximate case 2 by truncating to a fixed window. Measured
-    on vocab=151936: with ``p=0.9`` the exact kept set is ~6700 tokens/row, a
-    256-wide window keeps 171 (probs error 2e-1) and even a 4096-wide window
-    keeps 1877 (5e-2). For a flatter distribution the exact set is >100k.
-    """
-    if p is None:
-        if k is None:
-            return logits
-        # Avoid sorting vocab for top-k only case.
-        return apply_top_k_only(logits, k)
-
-    if k is not None:
-        select_k = min(int(k.max().item()), logits.shape[1])
-        if select_k <= max_select_k:
-            return _top_k_top_p_partial_sort(logits, k, p, select_k)
-        logits = kunlun_ops.top_k_mask_logits(logits, k)
-
-    renorm = kunlun_ops.top_p_renorm_probs(
-        logits.softmax(dim=-1, dtype=torch.float32), p
-    )
-    return logits.masked_fill_(renorm == 0, float("-inf"))
+def apply_top_k_top_p_optimized(logits, k, p, max_select_k=8192):
+    """Compatibility entry for fused top-k/top-p filtering."""
+    return apply_top_k_top_p(logits, k, p)
 
 
-def _top_k_top_p_partial_sort(
-    logits: torch.Tensor,
-    k: torch.Tensor,
-    p: torch.Tensor,
-    select_k: int,
-) -> torch.Tensor:
-    batch, vocab_size = logits.shape
-    # [batch, select_k], descending.
-    topk_vals, topk_idx = logits.topk(select_k, dim=1, largest=True, sorted=True)
-
-    # Apply top-k inside the window (k is a 1-based count).
-    k_thresh = topk_vals.gather(1, (k.to(torch.long) - 1).unsqueeze(1))
-    topk_vals.masked_fill_(topk_vals < k_thresh, -float("inf"))
-
-    # Apply top-p on the window. Descending exclusive cumsum >= p is the same
-    # cut as the ascending ``cumsum <= 1 - p`` used by the sort implementation.
-    probs_sort = topk_vals.softmax(dim=-1)
-    probs_cumsum = probs_sort.cumsum(dim=-1)
-    top_p_mask = (probs_cumsum - probs_sort) >= p.unsqueeze(1)
-    top_p_mask[:, 0] = False  # keep at least one token
-    topk_vals.masked_fill_(top_p_mask, -float("inf"))
-
-    out = logits.new_full((batch, vocab_size), -float("inf"))
-    out.scatter_(1, topk_idx, topk_vals)
-    return out
 
 
 def apply_top_k_only(
