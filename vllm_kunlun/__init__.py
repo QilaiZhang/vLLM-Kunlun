@@ -99,6 +99,26 @@ def _dispatch_post_import_hooks():
         _POST_IMPORT_DISPATCH_IN_PROGRESS["v"] = False
 
 
+# Native Gumbel sampling must be installed before importing its callers.
+def _gumbel_native_applied(mod):
+    return (not hasattr(mod, "gumbel_sample")
+            or getattr(mod, "_kunlun_native_gumbel", False))
+
+
+def _gumbel_native_apply(mod):
+    from vllm_kunlun.v1.worker.gpu.sample.gumbel import (
+        apply_temperature, gumbel_sample,
+    )
+    mod.apply_temperature = apply_temperature
+    mod.gumbel_sample = gumbel_sample
+    mod._kunlun_native_gumbel = True
+
+
+_register_post_import_hook(
+    "vllm.v1.worker.gpu.sample.gumbel", _gumbel_native_applied, _gumbel_native_apply
+)
+
+
 # --- hook 1: KVBlockZeroer in vllm.v1.worker.utils ------------------------
 # Importing the kunlun replacement module triggers an in-place class
 # patch (``_kunlun_patched`` flag set on KVBlockZeroer). See
