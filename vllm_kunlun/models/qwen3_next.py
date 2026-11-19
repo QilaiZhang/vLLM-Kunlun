@@ -470,6 +470,13 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         return query, key, value, z, b, a
 
+    @torch.no_grad()
+    def prepare_packed_gdn_fp32_params(self):
+        self._packed_gdn_fp32_params = (
+            self.A_log.detach().float().contiguous(),
+            self.dt_bias.detach().float().contiguous(),
+        )
+
     def rearrange_mixed_qkv(self, mixed_qkv):
         if mixed_qkv is None:
             return None, None, None
@@ -689,10 +696,16 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             and non_spec_state_indices_tensor.dtype == torch.int32
         ):
             state_indices = non_spec_state_indices_tensor[:num_actual_tokens]
+            params = getattr(self, "_packed_gdn_fp32_params", None)
+            if params is None or any(
+                param.device != mixed_qkv_non_spec.device for param in params
+            ):
+                params = self.A_log.float().contiguous(), self.dt_bias.float().contiguous()
+            A_log, dt_bias = params
             out = packed_decode(
-                self.A_log.float().contiguous(),
+                A_log,
                 a.float().contiguous(),
-                self.dt_bias.float().contiguous(),
+                dt_bias,
                 mixed_qkv_non_spec.unsqueeze(0),
                 b.float().contiguous(),
                 ssm_state,
@@ -1347,6 +1360,9 @@ class Qwen3NextModel(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+        for layer in self.modules():
+            if isinstance(layer, Qwen3NextGatedDeltaNet):
+                layer.prepare_packed_gdn_fp32_params()
         return loaded_params
 
 
