@@ -470,6 +470,13 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         return query, key, value, z, b, a
 
+    @torch.no_grad()
+    def prepare_packed_gdn_fp32_params(self):
+        self._packed_gdn_fp32_params = (
+            self.A_log.detach().float().contiguous(),
+            self.dt_bias.detach().float().contiguous(),
+        )
+
     def rearrange_mixed_qkv(self, mixed_qkv):
         if mixed_qkv is None:
             return None, None, None
@@ -658,6 +665,60 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             )
         else:
             mixed_qkv_non_spec = None
+
+        packed_decode = getattr(
+            kunlun_ops, "fused_recurrent_gated_delta_rule_packed_decode", None
+        )
+        if (
+            callable(packed_decode)
+            and getattr(packed_decode, "supports_state_slot_stride", False)
+            and spec_sequence_masks is None
+            and attn_metadata.num_prefills == 0
+            and attn_metadata.num_decodes == num_actual_tokens
+            and mixed_qkv_non_spec is not None
+            and mixed_qkv_non_spec.is_cuda
+            and mixed_qkv_non_spec.dtype == torch.float16
+            and mixed_qkv_non_spec.is_contiguous()
+            and mixed_qkv_non_spec.size(0) == num_actual_tokens
+            and ssm_state.dtype in (torch.float16, torch.float32)
+            and (
+                ssm_state.is_contiguous()
+                or (
+                    getattr(packed_decode, "supports_state_slot_stride", False)
+                    and ssm_state.ndim == 4
+                    and ssm_state.stride(3) == 1
+                    and ssm_state.stride(2) == ssm_state.size(3)
+                    and ssm_state.stride(1) == ssm_state.size(2) * ssm_state.size(3)
+                    and ssm_state.stride(0) >= ssm_state.stride(1) * ssm_state.size(1)
+                )
+            )
+            and non_spec_state_indices_tensor.ndim == 1
+            and non_spec_state_indices_tensor.dtype == torch.int32
+        ):
+            state_indices = non_spec_state_indices_tensor[:num_actual_tokens]
+            params = getattr(self, "_packed_gdn_fp32_params", None)
+            if params is None or any(
+                param.device != mixed_qkv_non_spec.device for param in params
+            ):
+                params = self.A_log.float().contiguous(), self.dt_bias.float().contiguous()
+            A_log, dt_bias = params
+            out = packed_decode(
+                A_log,
+                a.float().contiguous(),
+                dt_bias,
+                mixed_qkv_non_spec.unsqueeze(0),
+                b.float().contiguous(),
+                ssm_state,
+                state_indices.contiguous(),
+                self.num_k_heads // self.tp_size,
+                use_qk_l2norm_in_kernel=True,
+                is_h0_transposed=True,
+                cu_seqlens=non_spec_query_start_loc[
+                    : attn_metadata.num_decodes + 1
+                ].contiguous(),
+            )
+            core_attn_out[:num_actual_tokens] = out.squeeze(0)
+            return
 
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
         query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
@@ -1299,6 +1360,9 @@ class Qwen3NextModel(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+        for layer in self.modules():
+            if isinstance(layer, Qwen3NextGatedDeltaNet):
+                layer.prepare_packed_gdn_fp32_params()
         return loaded_params
 
 

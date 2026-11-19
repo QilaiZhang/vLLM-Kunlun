@@ -494,6 +494,9 @@ class Qwen3_5Model(Qwen3NextModel):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+        for layer in self.modules():
+            if isinstance(layer, Qwen3_5GatedDeltaNet):
+                layer.prepare_packed_gdn_fp32_params()
         return loaded_params
 
 
